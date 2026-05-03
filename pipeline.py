@@ -106,10 +106,6 @@ def read_description(folder_path):
                 if file.endswith(".txt"):
                     with open(file_path, encoding='utf-8') as f:
                         return f.read().strip()
-                if file.endswith(".yaml") or file.endswith(".yml"):
-                    with open(file_path, encoding='utf-8') as f:
-                        raw = f.read()
-                    return parse_yaml_description(raw)
     return None
 
 def find_row_by_basket(df, folder_name):
