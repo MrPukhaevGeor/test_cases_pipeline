@@ -1,0 +1,16 @@
+import pandas as pd
+
+columns = [
+    "Приоритет для использования в GC тестах",
+    "Роли для сценария",
+    "Сценарий",
+    "Языки программирования (ЯП)",
+    "Описание задачи",
+    "Объём (сколько вопросов)",
+    "Материалы для оценки качества корзины",
+    "Корзины"
+]
+
+df = pd.DataFrame(columns=columns)
+df.to_excel("table.xlsx", sheet_name="Sheet1", index=False)
+print("table.xlsx создан!")
