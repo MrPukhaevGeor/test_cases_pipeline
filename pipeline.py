@@ -3,6 +3,7 @@ import json
 import logging
 import pandas as pd
 import yaml
+import re
 from difflib import SequenceMatcher
 
 # Настройки
@@ -97,15 +98,52 @@ def parse_yaml_description(content):
         log.warning(f"не удалось распарсить yaml: {e}")
     return content.strip()
 
+def clean_text(text):
+    """Очищает текст: нижний регистр, удаляет спецсимволы"""
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r'[^a-zа-яё0-9\s\.\,]', '', text)
+    return text.strip()
+    
 def read_description(folder_path):
+    """Читает описание из папки 01_in"""
     for item in sorted(os.listdir(folder_path)):
         item_path = os.path.join(folder_path, item)
         if os.path.isdir(item_path) and item.startswith("01_"):
-            for file in os.listdir(item_path):
-                file_path = os.path.join(item_path, file)
-                if file.endswith(".txt"):
+            txt_files = [f for f in os.listdir(item_path) if f.endswith(".txt")]
+            if not txt_files:
+                return None
+            for file in txt_files:
+                file_lower = file.lower()
+                # Файл заканчивается на task
+                if file_lower.endswith("task.txt"):
+                    file_path = os.path.join(item_path, file)
                     with open(file_path, encoding='utf-8') as f:
-                        return f.read().strip()
+                        content = f.read().strip()
+                    content = clean_text(content)
+                    if "задача" in content:
+                        parts = content.split("задача", 1)
+                        result = parts[1] if len(parts) > 1 else content
+                        
+                        result = result.lstrip(':').lstrip().lstrip('\n')
+                        next_header = re.search(r'\n#{1,3}', result)
+                        if next_header:
+                            result = result[:next_header.start()]
+                        lines = result.split('\n')
+                        result = ' '.join([l for l in lines if 'важно' not in l.lower()])
+                        return result.strip(
+                # Файл заканчивается на question
+                if file_lower.endswith("question.txt"):
+                    file_path = os.path.join(item_path, file)
+                    with open(file_path, encoding='utf-8') as f:
+                        first_line = f.readline().strip()
+                    return clean_text(first_line)
+            # Берем первый попавшийся .txt
+            file_path = os.path.join(item_path, txt_files[0])
+            with open(file_path, encoding='utf-8') as f:
+                content = f.read().strip()
+            return clean_text(content)
     return None
 
 def find_row_by_basket(df, folder_name):
