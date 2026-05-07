@@ -4,7 +4,7 @@ import logging
 import pandas as pd
 import yaml
 import re
-import urllib.request
+import subprocess
 from difflib import SequenceMatcher
 
 # Настройки
@@ -14,9 +14,7 @@ EXCEL_SHEET = "Sheet1"
 LEARNING_FILE = "learned_rules.json"
 LOG_FILE = "pipeline.log"
 SIMILARITY_THRESHOLD = 0.55
-GROQ_API_KEY = "8888"
 
-# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -61,56 +59,41 @@ def save_learned_rules(rules):
 def determine_role(description, learned_rules):
     if not description:
         return None
-
     desc_lower = description.lower()
     all_keywords = {}
     for role, keywords in ROLE_KEYWORDS.items():
         all_keywords[role] = keywords.copy()
-
     for keyword, role in learned_rules.get("keywords", {}).items():
         if role not in all_keywords:
             all_keywords[role] = {}
         all_keywords[role][keyword] = 2
-
     scores = {}
     for role, keywords in all_keywords.items():
         score = sum(w for word, w in keywords.items() if word in desc_lower)
         if score > 0:
             scores[role] = score
-
     if not scores:
         return None
-
     return max(scores, key=scores.get)
 
 def llm_fallback_role(description):
     try:
-        data = json.dumps({
-            "model": "llama3-8b-8192",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": f"Определи роль специалиста который выполняет задачу. Варианты только: Разработчик, Аналитик, Тестировщик. Ответь одним словом без пояснений.\n\nЗадача: {description[:300]}"
-                }
-            ],
-            "max_tokens": 10
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {GROQ_API_KEY}"
-            }
+        prompt = f"Определи роль специалиста который выполняет задачу. Варианты только: Разработчик, Аналитик, Тестировщик. Ответь одним словом без пояснений.\n\nЗадача: {description[:300]}"
+        result = subprocess.run(
+            ["gigacode", prompt],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding="utf-8"
         )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            result = json.loads(r.read())
-            answer = result["choices"][0]["message"]["content"].strip()
-            if answer in ["Разработчик", "Аналитик", "Тестировщик"]:
-                return answer
-            log.warning(f"llm вернул неожиданный ответ: {answer}")
+        answer = result.stdout.strip()
+        log.info(f"gigacode ответил: {answer}")
+        for role in ["Разработчик", "Аналитик", "Тестировщик"]:
+            if role in answer:
+                return role
+        log.warning(f"gigacode вернул неожиданный ответ: {answer}")
     except Exception as e:
-        log.warning(f"llm fallback не сработал: {e}")
+        log.warning(f"gigacode fallback не сработал: {e}")
     return None
 
 def parse_yaml_description(content):
@@ -147,7 +130,6 @@ def read_description(folder_path):
                         raw = f.read()
                     return parse_yaml_description(raw)
                 return None
-
             for file in txt_files:
                 if file.lower().endswith("task.txt"):
                     file_path = os.path.join(item_path, file)
@@ -164,21 +146,18 @@ def read_description(folder_path):
                         lines = result.split('\n')
                         result = ' '.join([l for l in lines if 'важно' not in l.lower()])
                         return result.strip()
-
             for file in txt_files:
                 if file.lower().endswith("question.txt"):
                     file_path = os.path.join(item_path, file)
                     with open(file_path, encoding='utf-8') as f:
                         first_line = f.readline().strip()
                     return clean_text(first_line)
-
             all_texts = []
             for file in txt_files:
                 file_path = os.path.join(item_path, file)
                 with open(file_path, encoding='utf-8') as f:
                     all_texts.append(f.read().strip())
             return clean_text(" ".join(all_texts))
-
     return None
 
 def find_row_by_basket(df, folder_name):
@@ -193,10 +172,8 @@ def find_row_by_basket(df, folder_name):
 def find_row_by_text(df, description, threshold=SIMILARITY_THRESHOLD):
     if "Описание задачи" not in df.columns:
         return None, 0
-
     best_match = None
     best_ratio = 0
-
     for idx, row in df.iterrows():
         task_desc = str(row["Описание задачи"]) if pd.notna(row["Описание задачи"]) else ""
         if not task_desc or task_desc.startswith("New "):
@@ -205,7 +182,6 @@ def find_row_by_text(df, description, threshold=SIMILARITY_THRESHOLD):
         if ratio > best_ratio and ratio > threshold:
             best_ratio = ratio
             best_match = idx
-
     return best_match, best_ratio
 
 def add_basket_to_cell(existing, new_basket):
@@ -235,7 +211,6 @@ def main():
     if not os.path.exists(EXCEL_FILE):
         log.error(f"файл {EXCEL_FILE} не найден")
         return
-
     if not os.path.exists(CASES_FOLDER):
         log.error(f"папка {CASES_FOLDER} не найдена")
         return
@@ -275,7 +250,7 @@ def main():
         else:
             role = llm_fallback_role(description)
             if role:
-                log.info(f"  роль (llm): {role}")
+                log.info(f"  роль (gigacode): {role}")
                 stats["auto"] += 1
             else:
                 log.info("  роль не определена, спрашиваем вручную")
@@ -318,7 +293,6 @@ def main():
             df.at[row_idx, "Корзины"] = add_basket_to_cell(
                 df.at[row_idx, "Корзины"], folder_name
             )
-
         if "Роли для сценария" in df.columns:
             current_role = df.at[row_idx, "Роли для сценария"]
             if pd.isna(current_role) or str(current_role).strip() == "":
