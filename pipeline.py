@@ -4,6 +4,7 @@ import logging
 import pandas as pd
 import yaml
 import re
+import urllib.request
 from difflib import SequenceMatcher
 
 # Настройки
@@ -12,7 +13,8 @@ EXCEL_FILE = "table.xlsx"
 EXCEL_SHEET = "Sheet1"
 LEARNING_FILE = "learned_rules.json"
 LOG_FILE = "pipeline.log"
-SIMILARITY_THRESHOLD = 0.7  # подняли с 0.5 до 0.7
+SIMILARITY_THRESHOLD = 0.55
+GROQ_API_KEY = "8888"
 
 # Логирование
 logging.basicConfig(
@@ -81,16 +83,43 @@ def determine_role(description, learned_rules):
 
     return max(scores, key=scores.get)
 
+def llm_fallback_role(description):
+    try:
+        data = json.dumps({
+            "model": "llama3-8b-8192",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Определи роль специалиста который выполняет задачу. Варианты только: Разработчик, Аналитик, Тестировщик. Ответь одним словом без пояснений.\n\nЗадача: {description[:300]}"
+                }
+            ],
+            "max_tokens": 10
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = json.loads(r.read())
+            answer = result["choices"][0]["message"]["content"].strip()
+            if answer in ["Разработчик", "Аналитик", "Тестировщик"]:
+                return answer
+            log.warning(f"llm вернул неожиданный ответ: {answer}")
+    except Exception as e:
+        log.warning(f"llm fallback не сработал: {e}")
+    return None
+
 def parse_yaml_description(content):
-    """парсим yaml нормально — вытаскиваем текстовые поля"""
     try:
         data = yaml.safe_load(content)
         if isinstance(data, dict):
-            # ищем поля где может быть описание задачи
             for key in ["description", "instruction", "task", "scenario", "name", "title"]:
                 if key in data and isinstance(data[key], str):
                     return data[key].strip()
-            # если не нашли — берём все строковые значения
             texts = [str(v) for v in data.values() if isinstance(v, str) and len(v) > 10]
             if texts:
                 return " ".join(texts[:3])
@@ -99,25 +128,28 @@ def parse_yaml_description(content):
     return content.strip()
 
 def clean_text(text):
-    """Очищает текст: нижний регистр, удаляет спецсимволы"""
     if not text:
         return ""
     text = text.lower()
     text = re.sub(r'[^a-zа-яё0-9\s\.\,]', '', text)
     return text.strip()
-    
+
 def read_description(folder_path):
-    """Читает описание из папки 01_in"""
     for item in sorted(os.listdir(folder_path)):
         item_path = os.path.join(folder_path, item)
         if os.path.isdir(item_path) and item.startswith("01_"):
             txt_files = [f for f in os.listdir(item_path) if f.endswith(".txt")]
             if not txt_files:
+                yaml_files = [f for f in os.listdir(item_path) if f.endswith(".yaml") or f.endswith(".yml")]
+                if yaml_files:
+                    file_path = os.path.join(item_path, yaml_files[0])
+                    with open(file_path, encoding='utf-8') as f:
+                        raw = f.read()
+                    return parse_yaml_description(raw)
                 return None
+
             for file in txt_files:
-                file_lower = file.lower()
-                # Файл заканчивается на task
-                if file_lower.endswith("task.txt"):
+                if file.lower().endswith("task.txt"):
                     file_path = os.path.join(item_path, file)
                     with open(file_path, encoding='utf-8') as f:
                         content = f.read().strip()
@@ -125,25 +157,28 @@ def read_description(folder_path):
                     if "задача" in content:
                         parts = content.split("задача", 1)
                         result = parts[1] if len(parts) > 1 else content
-                        
                         result = result.lstrip(':').lstrip().lstrip('\n')
                         next_header = re.search(r'\n#{1,3}', result)
                         if next_header:
                             result = result[:next_header.start()]
                         lines = result.split('\n')
                         result = ' '.join([l for l in lines if 'важно' not in l.lower()])
-                        return result.strip(
-                # Файл заканчивается на question
-                if file_lower.endswith("question.txt"):
+                        return result.strip()
+
+            for file in txt_files:
+                if file.lower().endswith("question.txt"):
                     file_path = os.path.join(item_path, file)
                     with open(file_path, encoding='utf-8') as f:
                         first_line = f.readline().strip()
                     return clean_text(first_line)
-            # Берем первый попавшийся .txt
-            file_path = os.path.join(item_path, txt_files[0])
-            with open(file_path, encoding='utf-8') as f:
-                content = f.read().strip()
-            return clean_text(content)
+
+            all_texts = []
+            for file in txt_files:
+                file_path = os.path.join(item_path, file)
+                with open(file_path, encoding='utf-8') as f:
+                    all_texts.append(f.read().strip())
+            return clean_text(" ".join(all_texts))
+
     return None
 
 def find_row_by_basket(df, folder_name):
@@ -182,7 +217,6 @@ def add_basket_to_cell(existing, new_basket):
     return f"{existing_str}, {new_basket}"
 
 def learn_from_manual(description, role, learned_rules):
-    """запоминаем топ-3 значимых слова вместо одного"""
     words = [w for w in description.lower().split() if len(w) > 4]
     words = [w for w in words if w not in learned_rules["keywords"]]
     added = 0
@@ -195,13 +229,7 @@ def learn_from_manual(description, role, learned_rules):
     save_learned_rules(learned_rules)
 
 def save_excel_safe(df, filepath, sheet):
-    """сохраняем во временный файл сначала чтобы не потерять данные"""
-    tmp = filepath + ".tmp"
-    df.to_excel(tmp, sheet_name=sheet, index=False)
-    if os.path.exists(filepath):
-        os.replace(tmp, filepath)
-    else:
-        os.rename(tmp, filepath)
+    df.to_excel(filepath, index=False)
 
 def main():
     if not os.path.exists(EXCEL_FILE):
@@ -245,31 +273,34 @@ def main():
             log.info(f"  роль (авто): {role}")
             stats["auto"] += 1
         else:
-            log.info("  роль не определена автоматически")
-            print(f"\n[{folder_name}] выбери роль:")
-            print("  1 - Разработчик")
-            print("  2 - Аналитик")
-            print("  3 - Тестировщик")
-            while True:
-                choice = input("  выбор (1/2/3): ").strip()
-                if choice == '1':
-                    role = "Разработчик"
-                    break
-                elif choice == '2':
-                    role = "Аналитик"
-                    break
-                elif choice == '3':
-                    role = "Тестировщик"
-                    break
-            learn_from_manual(description, role, learned_rules)
-            stats["manual"] += 1
+            role = llm_fallback_role(description)
+            if role:
+                log.info(f"  роль (llm): {role}")
+                stats["auto"] += 1
+            else:
+                log.info("  роль не определена, спрашиваем вручную")
+                print(f"\n[{folder_name}] выбери роль:")
+                print("  1 - Разработчик")
+                print("  2 - Аналитик")
+                print("  3 - Тестировщик")
+                while True:
+                    choice = input("  выбор (1/2/3): ").strip()
+                    if choice == '1':
+                        role = "Разработчик"
+                        break
+                    elif choice == '2':
+                        role = "Аналитик"
+                        break
+                    elif choice == '3':
+                        role = "Тестировщик"
+                        break
+                learn_from_manual(description, role, learned_rules)
+                stats["manual"] += 1
 
-        # шаг 1 — по названию папки
         row_idx = find_row_by_basket(df, folder_name)
         if row_idx is not None:
             log.info(f"  найдена по названию → строка {row_idx + 1}")
         else:
-            # шаг 2 — по тексту
             row_idx, ratio = find_row_by_text(df, description)
             if row_idx is not None:
                 log.info(f"  найдена по тексту ({ratio:.0%}) → строка {row_idx + 1}")
