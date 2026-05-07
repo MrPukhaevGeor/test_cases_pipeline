@@ -8,7 +8,7 @@ import subprocess
 from difflib import SequenceMatcher
 
 # Настройки
-CASES_FOLDER = "test_cases/test_buckets/cases"
+CASES_FOLDER = "test_cases_synthetic/test_buckets/cases"
 EXCEL_FILE = "table.xlsx"
 EXCEL_SHEET = "Sheet1"
 LEARNING_FILE = "learned_rules.json"
