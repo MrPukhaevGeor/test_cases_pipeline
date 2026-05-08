@@ -74,6 +74,8 @@ def determine_role(description, learned_rules):
             scores[role] = score
     if not scores:
         return None
+    matched = [w for w in all_keywords[best_role] if w in desc_lower]
+    log.info(f"  роль {best_role} по словам: {matched}")
     return max(scores, key=scores.get)
 
 def llm_fallback_role(description):
