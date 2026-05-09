@@ -42,7 +42,7 @@ ROLE_KEYWORDS = {
         "тест": 1, "найди": 1, "ошибку": 1, "qa": 1
     },
     "Dpeople": {
-        "data science": 3, "machine learning": 3, "нейросет": 3, "ml": 2,
+        "data science": 3, "machine learning": 3, "нейросет": 3,
         "датасет": 2, "модель обуч": 2, "исследоват": 2, "выборк": 1
     }
 }
@@ -59,7 +59,7 @@ def save_learned_rules(rules):
 
 def determine_role(text, learned_rules):
     if not text:
-        return None, 0
+        return None
     t = text.lower()
     all_kw = {}
     for role, kw in ROLE_KEYWORDS.items():
@@ -69,21 +69,15 @@ def determine_role(text, learned_rules):
             all_kw[role] = {}
         all_kw[role][word] = 2
     scores = {}
-    matched_count = 0
     for role, kw in all_kw.items():
-        score = 0
-        for word, w in kw.items():
-            if word in t:
-                score += w
-                matched_count += 1
+        score = sum(w for word, w in kw.items() if word in t)
         if score > 0:
             scores[role] = score
-    if not scores or matched_count < 3:
-        return None, matched_count
-    return max(scores, key=scores.get), matched_count
+    if not scores:
+        return None
+    return max(scores, key=scores.get)
 
 def llm_fallback_role(description, learned_rules):
-    time.sleep(1)
     try:
         from zai import ZaiClient
         import httpx
@@ -93,38 +87,48 @@ def llm_fallback_role(description, learned_rules):
             http_client=httpx.Client(verify=False)
         )
 
-        response = client.chat.completions.create(
-            model="glm-4.7-flash",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты определяешь роль IT специалиста по описанию задачи. "
-                        "Разработчик — пишет код, ревьюит, рефакторит, добавляет функционал. "
-                        "Аналитик (Б+С) — работает с данными, SQL, требованиями, бизнес-атрибутами. "
-                        "Тестировщик — пишет тесты, ищет баги, проверяет уязвимости. "
-                        "Dpeople — data science, ML, нейросети. "
-                        "Другие — если не подходит ни одна роль. "
-                        "Ответь строго одним из: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople, Другие."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"Задача: {description[:500]}"
-                }
-            ]
-        )
-
-        answer = response.choices[0].message.content.strip()
-        log.info(f"  llm ответил: {answer}")
-
-        for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople", "Другие"]:
-            if role in answer:
-                learn_from_llm(description, role, learned_rules)
-                return role
+        for attempt in range(3):
+            try:
+                time.sleep(2 + attempt * 3)
+                response = client.chat.completions.create(
+                    model="glm-4.7-flash",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты определяешь роль IT специалиста по описанию задачи. "
+                                "Разработчик — пишет код, ревьюит, рефакторит, добавляет функционал. "
+                                "Аналитик (Б+С) — работает с данными, SQL, требованиями, бизнес-атрибутами. "
+                                "Тестировщик — пишет тесты, ищет баги, проверяет уязвимости. "
+                                "Dpeople — data science, ML, нейросети. "
+                                "Другие — если не подходит ни одна роль. "
+                                "Ответь строго одним из: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople, Другие."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Задача: {description[:500]}"
+                        }
+                    ]
+                )
+                answer = response.choices[0].message.content.strip()
+                log.info(f"  llm ответил: {answer}")
+                for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople", "Другие"]:
+                    if role in answer:
+                        learn_from_llm(description, role, learned_rules)
+                        return role
+                break
+            except Exception as e:
+                if "429" in str(e):
+                    wait = 5 * (attempt + 1)
+                    log.warning(f"  429 лимит, ждём {wait} сек")
+                    time.sleep(wait)
+                else:
+                    log.warning(f"  llm не сработал: {e}")
+                    return None
 
     except Exception as e:
-        log.warning(f"  llm не сработал: {e}")
+        log.warning(f"  llm недоступен: {e}")
     return None
 
 def learn_from_llm(description, role, learned_rules):
@@ -144,13 +148,11 @@ def learn_from_manual(description, role, learned_rules):
     save_learned_rules(learned_rules)
 
 def get_role(text, learned_rules):
-    role, matched = determine_role(text, learned_rules)
+    role = determine_role(text, learned_rules)
     if role:
         return role, "markers"
     role = llm_fallback_role(text, learned_rules)
-    if role and role != "Другие":
-        return role, "llm"
-    if role == "Другие":
+    if role:
         return role, "llm"
     print(f"\nне удалось определить роль для: {text[:80]}")
     print("1 - Разработчик\n2 - Аналитик (Б+С)\n3 - Тестировщик\n4 - Dpeople\n5 - Другие")
