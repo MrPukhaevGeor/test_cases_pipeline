@@ -2,6 +2,7 @@ import os
 import re
 import json
 import yaml
+import time
 import logging
 import pandas as pd
 from pathlib import Path
@@ -24,27 +25,25 @@ log = logging.getLogger(__name__)
 
 ROLE_KEYWORDS = {
     "Разработчик": {
-        "алгоритм": 3, "сортировка": 3, "перепиши": 3, "senior": 3,
+        "алгоритм": 3, "сортировка": 3, "перепиши": 3, "senior": 3, "principal": 3,
         "функцию": 2, "класс": 2, "оптимизируй": 2, "реализуй": 2,
-        "добавь функционал": 2, "валидацию": 2, "рефактор": 2,
-        "код": 1, "напиши": 1, "программа": 1, "интеграц": 1
+        "добавь функционал": 2, "валидацию": 2, "рефактор": 2, "ревью": 2,
+        "код": 1, "напиши": 1, "программа": 1, "интеграц": 1, "разработ": 1
     },
     "Аналитик (Б+С)": {
         "sql": 3, "витрина": 3, "бизнес-атрибут": 3, "аналитик": 3,
         "запрос": 2, "отчёт": 2, "дашборд": 2, "выборка": 2,
-        "обогащение": 2, "наименован": 2, "требован": 2, "систем": 2,
-        "данные": 1, "анализ": 1, "json": 1
+        "обогащение": 2, "наименован": 2, "требован": 2,
+        "данные": 1, "анализ": 1
     },
     "Тестировщик": {
         "юнит-тест": 3, "баг": 3, "тест-кейс": 3, "автотест": 3,
-        "sql-инъекц": 2, "проверь": 2, "отладка": 2, "инспекц": 2,
-        "уязвимост": 2,
+        "sql-инъекц": 2, "проверь": 2, "отладка": 2, "уязвимост": 2,
         "тест": 1, "найди": 1, "ошибку": 1, "qa": 1
     },
     "Dpeople": {
-        "data science": 3, "ml": 3, "нейросет": 3, "машинное обуч": 3,
-        "датасет": 2, "модель обуч": 2, "исследоват": 2,
-        "выборк": 1
+        "data science": 3, "machine learning": 3, "нейросет": 3, "ml": 2,
+        "датасет": 2, "модель обуч": 2, "исследоват": 2, "выборк": 1
     }
 }
 
@@ -60,7 +59,7 @@ def save_learned_rules(rules):
 
 def determine_role(text, learned_rules):
     if not text:
-        return None
+        return None, 0
     t = text.lower()
     all_kw = {}
     for role, kw in ROLE_KEYWORDS.items():
@@ -70,19 +69,21 @@ def determine_role(text, learned_rules):
             all_kw[role] = {}
         all_kw[role][word] = 2
     scores = {}
+    matched_count = 0
     for role, kw in all_kw.items():
-        score = sum(w for word, w in kw.items() if word in t)
+        score = 0
+        for word, w in kw.items():
+            if word in t:
+                score += w
+                matched_count += 1
         if score > 0:
             scores[role] = score
-    # если маркеров нашлось меньше 3 — не доверяем результату
-    matched_count = sum(1 for role, kw in all_kw.items() for word in kw if word in t)
-    if matched_count < 3:
-        return None
-    if not scores:
-        return None
-    return max(scores, key=scores.get)
+    if not scores or matched_count < 3:
+        return None, matched_count
+    return max(scores, key=scores.get), matched_count
 
 def llm_fallback_role(description, learned_rules):
+    time.sleep(1)
     try:
         from zai import ZaiClient
         import httpx
@@ -97,11 +98,19 @@ def llm_fallback_role(description, learned_rules):
             messages=[
                 {
                     "role": "system",
-                    "content": "Ты помощник который определяет роль специалиста по описанию задачи. Отвечай строго одним словом из списка: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople, Другие. Никаких пояснений."
+                    "content": (
+                        "Ты определяешь роль IT специалиста по описанию задачи. "
+                        "Разработчик — пишет код, ревьюит, рефакторит, добавляет функционал. "
+                        "Аналитик (Б+С) — работает с данными, SQL, требованиями, бизнес-атрибутами. "
+                        "Тестировщик — пишет тесты, ищет баги, проверяет уязвимости. "
+                        "Dpeople — data science, ML, нейросети. "
+                        "Другие — если не подходит ни одна роль. "
+                        "Ответь строго одним из: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople, Другие."
+                    )
                 },
                 {
                     "role": "user",
-                    "content": f"Задача: {description[:400]}"
+                    "content": f"Задача: {description[:500]}"
                 }
             ]
         )
@@ -111,7 +120,6 @@ def llm_fallback_role(description, learned_rules):
 
         for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople", "Другие"]:
             if role in answer:
-                # запоминаем ключевые слова которые помогли определить роль
                 learn_from_llm(description, role, learned_rules)
                 return role
 
@@ -120,19 +128,14 @@ def llm_fallback_role(description, learned_rules):
     return None
 
 def learn_from_llm(description, role, learned_rules):
-    """агент определил роль — запоминаем ключевые слова"""
     words = [w for w in description.lower().split() if len(w) > 4]
     words = [w for w in words if w not in learned_rules["keywords"]]
-    added = 0
     for word in words[:3]:
         learned_rules["keywords"][word] = role
         log.info(f"  запомнил от llm: '{word}' → {role}")
-        added += 1
-    if added:
-        save_learned_rules(learned_rules)
+    save_learned_rules(learned_rules)
 
 def learn_from_manual(description, role, learned_rules):
-    """человек определил роль — запоминаем ключевые слова"""
     words = [w for w in description.lower().split() if len(w) > 4]
     words = [w for w in words if w not in learned_rules["keywords"]]
     for word in words[:3]:
@@ -141,11 +144,13 @@ def learn_from_manual(description, role, learned_rules):
     save_learned_rules(learned_rules)
 
 def get_role(text, learned_rules):
-    role = determine_role(text, learned_rules)
+    role, matched = determine_role(text, learned_rules)
     if role:
         return role, "markers"
     role = llm_fallback_role(text, learned_rules)
-    if role:
+    if role and role != "Другие":
+        return role, "llm"
+    if role == "Другие":
         return role, "llm"
     print(f"\nне удалось определить роль для: {text[:80]}")
     print("1 - Разработчик\n2 - Аналитик (Б+С)\n3 - Тестировщик\n4 - Dpeople\n5 - Другие")
@@ -182,7 +187,7 @@ def get_scenario(yaml_data):
         return "code2code"
     if re.search(r'напиши|сгенерируй|реализуй|write|implement', combined):
         return "text2code"
-    if re.search(r'объясн|опиши|документ|ревью|explain|review', combined):
+    if re.search(r'объясн|опиши|документ|ревью|explain|review|анализ', combined):
         return "code2text"
     return "Не определено"
 
@@ -200,7 +205,7 @@ def load_yaml(path):
     except Exception:
         return None
 
-def load_json(path):
+def load_json_file(path):
     try:
         with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
@@ -294,25 +299,22 @@ def main():
             log.warning(f"  нет папки 01_in, пропускаем")
             continue
 
-        # yaml
         yaml_data = None
         if int_dir.exists():
             y_files = [f for f in int_dir.iterdir() if f.suffix.lower() in ('.yaml', '.yml')]
             if y_files:
                 yaml_data = load_yaml(y_files[0])
 
-        # json
         json_data = None
         lang = ""
         if out_dir.exists():
             j_files = [f for f in out_dir.iterdir() if f.suffix.lower() == '.json']
             j_files.sort(key=lambda x: 0 if x.name == 'case.json' else 1)
             if j_files:
-                json_data = load_json(j_files[0])
+                json_data = load_json_file(j_files[0])
                 if json_data:
                     lang = str(json_data.get("language", "")).strip()
 
-        # роль и описание
         role_text = ""
         desc = ""
 
@@ -338,7 +340,7 @@ def main():
         log.info(f"  роль ({method}): {role}")
 
         priority = get_priority(yaml_data)
-        if role in ("Другие",):
+        if role == "Другие":
             priority = ""
 
         scenario = get_scenario(yaml_data) if yaml_data else "Нет YAML"
