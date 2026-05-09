@@ -2,10 +2,11 @@ import os
 import re
 import json
 import yaml
+import time
 import logging
-import subprocess
 import pandas as pd
 from pathlib import Path
+from collections import Counter
 
 # Настройки
 BASE_PATH = Path("test_buckets/cases")
@@ -23,30 +24,41 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Маркеры с весами
+# Стоп-слова — не запоминаем как маркеры
+STOP_WORDS = {
+    "провести", "выполнить", "обеспечить", "касательно", "согласно",
+    "следующий", "необходимо", "представленных", "предложенных",
+    "контексте", "соответствии", "результатам", "критериям", "существующий",
+    "представленном", "потенциальные", "заданным", "пользователь", "пользователя",
+    "проведи", "сформируй", "напиши", "создай", "реализуй", "добавь",
+    "который", "которая", "которые", "может", "должен", "должна",
+    "также", "затем", "после", "перед", "через", "более", "менее",
+    "очень", "просто", "всегда", "никогда", "иногда", "сейчас",
+    "хорошо", "плохо", "правильно", "неправильно"
+}
+
 ROLE_KEYWORDS = {
     "Разработчик": {
-        "алгоритм": 3, "сортировка": 3, "перепиши": 3, "senior": 3,
+        "алгоритм": 3, "сортировка": 3, "перепиши": 3, "senior": 3, "principal": 3,
         "функцию": 2, "класс": 2, "оптимизируй": 2, "реализуй": 2,
-        "добавь функционал": 2, "валидацию": 2, "рефактор": 2,
-        "код": 1, "напиши": 1, "программа": 1, "интеграц": 1
+        "добавь функционал": 2, "валидацию": 2, "рефактор": 2, "ревью": 2,
+        "разработчик": 3, "разработ": 2,
+        "код": 1, "программа": 1, "интеграц": 1
     },
     "Аналитик (Б+С)": {
         "sql": 3, "витрина": 3, "бизнес-атрибут": 3, "аналитик": 3,
         "запрос": 2, "отчёт": 2, "дашборд": 2, "выборка": 2,
-        "обогащение": 2, "наименован": 2, "требован": 2, "систем": 2,
-        "данные": 1, "анализ": 1, "json": 1
+        "обогащение": 2, "наименован": 2, "требован": 2,
+        "анализ": 1
     },
     "Тестировщик": {
         "юнит-тест": 3, "баг": 3, "тест-кейс": 3, "автотест": 3,
-        "sql-инъекц": 2, "проверь": 2, "отладка": 2, "инспекц": 2,
-        "артефакт": 2, "уязвимост": 2,
-        "тест": 1, "найди": 1, "ошибку": 1, "qa": 1
+        "sql-инъекц": 2, "проверь": 2, "отладка": 2, "уязвимост": 2,
+        "тест": 1, "ошибку": 1, "qa": 2
     },
     "Dpeople": {
-        "data science": 3, "ml": 3, "нейросет": 3, "машинное обуч": 3,
-        "датасет": 2, "модель обуч": 2, "исследоват": 2,
-        "данные": 1, "выборк": 1
+        "data science": 3, "machine learning": 3, "нейросет": 3,
+        "датасет": 2, "модель обуч": 2, "исследоват": 2
     }
 }
 
@@ -62,7 +74,7 @@ def save_learned_rules(rules):
 
 def determine_role(text, learned_rules):
     if not text:
-        return "Другие"
+        return None, 0
     t = text.lower()
     all_kw = {}
     for role, kw in ROLE_KEYWORDS.items():
@@ -72,53 +84,110 @@ def determine_role(text, learned_rules):
             all_kw[role] = {}
         all_kw[role][word] = 2
     scores = {}
+    total_matches = 0
     for role, kw in all_kw.items():
-        score = sum(w for word, w in kw.items() if word in t)
+        score = 0
+        for word, w in kw.items():
+            if word in t:
+                score += w
+                total_matches += 1
         if score > 0:
             scores[role] = score
     if not scores:
-        return None
-    return max(scores, key=scores.get)
+        return None, 0
+    best = max(scores, key=scores.get)
+    confidence = scores[best]
+    return best, confidence
 
-def gigacode_fallback(text):
+def llm_fallback_role(description, learned_rules):
     try:
-        os.environ["PATH"] += r";C:\Users\23657234\.gigacode\bin"
-        prompt = f"Определи роль специалиста. Варианты: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople, Другие. Одно слово.\n\nЗадача: {text[:300]}"
-        result = subprocess.run(
-            [r"C:\Users\23657234\.gigacode\bin\gigacode.cmd", prompt],
-            capture_output=True, text=True, timeout=30, encoding="utf-8"
+        from zai import ZaiClient
+        import httpx
+        client = ZaiClient(
+            api_key="d840f0ee19834bf89e2e1e5d73b2f679.bgW44QKU0xHBBjRx",
+            http_client=httpx.Client(verify=False)
         )
-        answer = result.stdout.strip()
-        for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople", "Другие"]:
-            if role in answer:
-                return role
+        for attempt in range(3):
+            try:
+                time.sleep(2 + attempt * 3)
+                response = client.chat.completions.create(
+                    model="glm-4.7-flash",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты определяешь роль IT специалиста по описанию задачи. "
+                                "Разработчик — пишет код, ревьюит, рефакторит, добавляет функционал, делает code review. "
+                                "Аналитик (Б+С) — работает с данными, SQL, требованиями, бизнес-атрибутами, отчётами. "
+                                "Тестировщик — пишет тесты, ищет баги, проверяет уязвимости. "
+                                "Dpeople — data science, ML, нейросети. "
+                                "Если задача про код, программирование, разработку — это Разработчик. "
+                                "Не используй вариант Другие если задача связана с IT. "
+                                "Ответь строго одним из: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Задача: {description[:500]}"
+                        }
+                    ]
+                )
+                answer = response.choices[0].message.content.strip()
+                log.info(f"  llm ответил: {answer}")
+                for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople"]:
+                    if role in answer:
+                        learn_smart(description, role, learned_rules)
+                        return role
+                break
+            except Exception as e:
+                if "429" in str(e):
+                    wait = 5 * (attempt + 1)
+                    log.warning(f"  429 лимит, ждём {wait} сек")
+                    time.sleep(wait)
+                else:
+                    log.warning(f"  llm не сработал: {e}")
+                    return None
     except Exception as e:
-        log.warning(f"gigacode не сработал: {e}")
+        log.warning(f"  llm недоступен: {e}")
     return None
 
-def learn_from_manual(text, role, learned_rules):
-    words = [w for w in text.lower().split() if len(w) > 4]
+def learn_smart(description, role, learned_rules):
+    """запоминаем редкие слова, исключая стоп-слова"""
+    words = [w.strip('.,!?:;()[]') for w in description.lower().split()]
+    words = [w for w in words if len(w) > 4 and w not in STOP_WORDS]
     words = [w for w in words if w not in learned_rules["keywords"]]
-    for word in words[:3]:
+    # берём редкие слова — те которые встретились 1-2 раза в тексте
+    counter = Counter(words)
+    rare = [w for w, c in counter.items() if c <= 2]
+    for word in rare[:3]:
         learned_rules["keywords"][word] = role
-        log.info(f"запомнил: '{word}' → {role}")
+        log.info(f"  запомнил: '{word}' → {role}")
     save_learned_rules(learned_rules)
 
-def get_role(text, learned_rules):
-    role = determine_role(text, learned_rules)
-    if role:
+def get_role(text, learned_rules, confidence_threshold=2):
+    role, confidence = determine_role(text, learned_rules)
+    # если маркеры дали уверенный ответ — используем
+    if role and confidence >= confidence_threshold:
         return role, "markers"
-    role = gigacode_fallback(text)
+    # иначе идём в LLM
+    llm_role = llm_fallback_role(text, learned_rules)
+    if llm_role:
+        return llm_role, "llm"
+    # фоллбек на маркеры даже с низкой уверенностью
     if role:
-        return role, "gigacode"
+        return role, "markers_low"
+    # совсем ничего — спрашиваем человека
     print(f"\nне удалось определить роль для: {text[:80]}")
     print("1 - Разработчик\n2 - Аналитик (Б+С)\n3 - Тестировщик\n4 - Dpeople\n5 - Другие")
     while True:
         choice = input("выбор (1-5): ").strip()
-        roles = {"1": "Разработчик", "2": "Аналитик (Б+С)", "3": "Тестировщик", "4": "Dpeople", "5": "Другие"}
+        roles = {
+            "1": "Разработчик", "2": "Аналитик (Б+С)",
+            "3": "Тестировщик", "4": "Dpeople", "5": "Другие"
+        }
         if choice in roles:
             role = roles[choice]
-            learn_from_manual(text, role, learned_rules)
+            learn_smart(text, role, learned_rules)
             return role, "manual"
 
 def get_priority(yaml_data):
@@ -127,23 +196,40 @@ def get_priority(yaml_data):
     cat = str(yaml_data.get("testability_category", "")).strip().upper()
     return {"A": "0", "B": "1", "C": "2", "D": "3"}.get(cat, "")
 
-def get_scenario(yaml_data):
+def get_scenario(yaml_data, json_data=None):
+    """определяем сценарий из yaml.instruction или json.instruction"""
     if not isinstance(yaml_data, dict):
         return "Не определено"
+
+    # собираем весь возможный текст
+    parts = []
     sys_p = str(yaml_data.get("system", yaml_data.get("system_prompt", "")))
     usr_p = str(yaml_data.get("user", yaml_data.get("user_prompt", "")))
-    if not sys_p and not usr_p and "prompts" in yaml_data:
+    instr = yaml_data.get("instruction", "")
+    if isinstance(instr, list):
+        instr = " ".join(str(i) for i in instr)
+    parts.extend([sys_p, usr_p, str(instr)])
+
+    if "prompts" in yaml_data:
         p = yaml_data["prompts"]
-        sys_p = str(p.get("system", p.get("system_prompt", "")))
-        usr_p = str(p.get("user", p.get("user_prompt", "")))
-    combined = f"{sys_p} {usr_p}".lower()
-    if re.search(r'json|xml|yaml|csv|структурир|extract', combined):
+        parts.append(str(p.get("system", p.get("system_prompt", ""))))
+        parts.append(str(p.get("user", p.get("user_prompt", ""))))
+
+    if json_data and isinstance(json_data, dict):
+        parts.append(str(json_data.get("instruction", "")))
+
+    combined = " ".join(parts).lower()
+
+    if not combined.strip():
+        return "Не определено"
+
+    if re.search(r'json|xml|yaml|csv|структурир|extract|формат вывод|структуру', combined):
         return "code2structured_output"
-    if re.search(r'рефактор|оптимиз|исправ|refactor|migrate', combined):
+    if re.search(r'рефактор|оптимиз|исправ|refactor|migrate|перепиш', combined):
         return "code2code"
-    if re.search(r'напиши|сгенерируй|реализуй|write|implement', combined):
+    if re.search(r'напиши|сгенерируй|реализуй|write|implement|создай функц', combined):
         return "text2code"
-    if re.search(r'объясн|опиши|документ|ревью|explain|review', combined):
+    if re.search(r'объясн|опиши|документ|ревью|explain|review|проанализ|анализ кода', combined):
         return "code2text"
     return "Не определено"
 
@@ -154,6 +240,15 @@ def clean_text(text):
     text = re.sub(r'[^\w\sа-яА-ЯёЁ:,\.\-\(\)\/]', '', text)
     return re.sub(r'\s+', ' ', text).strip()
 
+def normalize_for_grouping(text):
+    """более мягкая нормализация для группировки"""
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r'[^\wа-яё\s]', ' ', text)
+    words = [w for w in text.split() if len(w) > 3 and w not in STOP_WORDS]
+    return " ".join(sorted(words[:10]))  # первые 10 значимых слов
+
 def load_yaml(path):
     try:
         with open(path, encoding="utf-8-sig") as f:
@@ -161,7 +256,7 @@ def load_yaml(path):
     except Exception:
         return None
 
-def load_json(path):
+def load_json_file(path):
     try:
         with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
@@ -173,17 +268,26 @@ def get_description_04(in_dir):
     if not task_files:
         return "", ""
     content = open(task_files[0], encoding="utf-8-sig").read()
-    lines = content.splitlines()
+    content = re.sub(r'[*_#~`]', '', content)
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
     role_text = ""
     task_text = ""
-    for line in lines:
-        clean = re.sub(r'[*_#~`]', '', line).lower().strip()
-        if 'роль' in clean and not role_text:
-            parts = clean.split('роль', 1)
-            role_text = parts[1].strip().lstrip(':* ')
-        if 'задача' in clean and not task_text:
-            parts = clean.split('задача', 1)
-            task_text = parts[1].strip().lstrip(':* ')
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if 'роль' in low and not role_text:
+            after = low.split('роль', 1)[1].strip().lstrip(':')
+            if after:
+                role_text = after
+            elif i + 1 < len(lines):
+                role_text = lines[i + 1]
+        if 'задача' in low and not task_text:
+            after = low.split('задача', 1)[1].strip().lstrip(':')
+            if after:
+                task_text = after
+            elif i + 1 < len(lines):
+                task_text = lines[i + 1]
+        if role_text and task_text:
+            break
     return clean_text(role_text), clean_text(task_text)
 
 def get_description_05(json_data):
@@ -192,11 +296,19 @@ def get_description_05(json_data):
         return ""
     first = instr.find('\n')
     if first == -1:
-        return ""
+        return clean_text(instr[:200])
     second = instr.find('\n', first + 1)
     if second == -1:
-        return ""
+        return clean_text(instr[first + 1:])
     return clean_text(instr[first + 1:second])
+
+def normalize_for_metric(text):
+    """нормализация текста для сравнения метрики"""
+    if not text:
+        return ""
+    text = re.sub(r'[*_#~`]', '', str(text))
+    text = re.sub(r'\s+', ' ', text).strip().lower()
+    return text
 
 def calc_metric(case_type, in_dir, yaml_data):
     if case_type in ("01", "02", "03", "06"):
@@ -218,15 +330,17 @@ def calc_metric(case_type, in_dir, yaml_data):
             if true_ans:
                 try:
                     content = open(ans_files[0], encoding="utf-8-sig").read()
-                    match = re.sub(r'\s+', ' ', content).strip().lower() == re.sub(r'\s+', ' ', str(true_ans)).strip().lower()
+                    a = normalize_for_metric(content)
+                    b = normalize_for_metric(str(true_ans))
+                    match = a == b
+                    if match:
+                        log.info(f"  метрика: 1 (точное совпадение)")
                     return (1 if match else 0), True
                 except Exception:
                     pass
     return 0, False
 
 def main():
-    os.environ["PATH"] += r";C:\Users\23657234\.gigacode\bin"
-
     if not BASE_PATH.exists():
         log.error(f"папка {BASE_PATH} не найдена")
         return
@@ -234,10 +348,10 @@ def main():
     learned_rules = load_learned_rules()
     log.info(f"загружено правил: {len(learned_rules.get('keywords', {}))}")
 
-    aggregated = {}
-
     cases = sorted([d for d in BASE_PATH.iterdir() if d.is_dir()])
     log.info(f"найдено папок: {len(cases)}")
+
+    aggregated = {}
 
     for case_dir in cases:
         m = re.search(r'case_(\d{2})', case_dir.name)
@@ -257,25 +371,26 @@ def main():
             log.warning(f"  нет папки 01_in, пропускаем")
             continue
 
-        # yaml
         yaml_data = None
         if int_dir.exists():
             y_files = [f for f in int_dir.iterdir() if f.suffix.lower() in ('.yaml', '.yml')]
             if y_files:
                 yaml_data = load_yaml(y_files[0])
 
-        # json
         json_data = None
         lang = ""
         if out_dir.exists():
             j_files = [f for f in out_dir.iterdir() if f.suffix.lower() == '.json']
             j_files.sort(key=lambda x: 0 if x.name == 'case.json' else 1)
             if j_files:
-                json_data = load_json(j_files[0])
+                json_data = load_json_file(j_files[0])
                 if json_data:
                     lang = str(json_data.get("language", "")).strip()
 
-        # роль и описание
+        # язык также можно взять из yaml
+        if not lang and isinstance(yaml_data, dict):
+            lang = str(yaml_data.get("language", "")).strip()
+
         role_text = ""
         desc = ""
 
@@ -297,31 +412,35 @@ def main():
         if not desc:
             desc = "Без описания"
 
-        # определяем роль
-        role, method = get_role(role_text or desc, learned_rules)
+        # для определения роли используем максимально полный текст
+        full_text = role_text or desc
+        if isinstance(yaml_data, dict):
+            instr = yaml_data.get("instruction", "")
+            if isinstance(instr, list):
+                instr = " ".join(str(i) for i in instr)
+            full_text = f"{full_text} {instr}".strip()
+
+        role, method = get_role(full_text, learned_rules)
         log.info(f"  роль ({method}): {role}")
 
-        # приоритет
         priority = get_priority(yaml_data)
-        if role in ("Другие",):
+        if role == "Другие":
             priority = ""
 
-        # сценарий
-        scenario = get_scenario(yaml_data) if yaml_data else "Нет YAML"
+        scenario = get_scenario(yaml_data, json_data)
 
-        # материалы
         materials = ""
         md_files = list(in_dir.glob("*.md"))
         if md_files:
             materials = md_files[0].name
 
-        # метрика
         metric_score, has_metric = calc_metric(case_type, in_dir, yaml_data)
 
-        # группировка
+        # мягкая группировка по нормализованному описанию
+        desc_normalized = normalize_for_grouping(desc)
         key = (
             role.lower(), scenario.lower(), lang.lower(),
-            desc.lower()[:100], materials.lower(), priority
+            desc_normalized, materials.lower(), priority
         )
 
         if key not in aggregated:
@@ -331,11 +450,13 @@ def main():
                 "priority": priority, "metric_sum": 0.0, "has_metric": False
             }
         aggregated[key]["baskets"].append(case_dir.name)
+        # берём самое короткое описание из похожих
+        if len(desc) < len(aggregated[key]["desc"]) and desc != "Без описания":
+            aggregated[key]["desc"] = desc
         if has_metric:
             aggregated[key]["metric_sum"] += metric_score
             aggregated[key]["has_metric"] = True
 
-    # итоговая таблица
     rows = []
     for data in aggregated.values():
         vol = len(data["baskets"])
@@ -364,7 +485,6 @@ def main():
         "Оценка качества (метрика)", "Контакт для связи"
     ])
     df.to_excel(OUTPUT_FILE, index=False)
-
     log.info(f"готово — {len(df)} строк в {OUTPUT_FILE}")
 
 if __name__ == "__main__":
