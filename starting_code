@@ -1,91 +1,222 @@
 import os
 import json
+import logging
 import pandas as pd
+import yaml
+import re
+import subprocess
 from difflib import SequenceMatcher
 
-# Настройки
-ARCHIVE_FOLDER = "test_cases"                  # папка с распакованным архивом
-EXCEL_FILE = "table.xlsx"                      # Excel-файл с таблицей
-EXCEL_SHEET = "Sheet1"                          # название листа в Excel
 
-# Правила для определения роли (веса 3/2/1, где 3 самый сильный и весомый)
+CASES_FOLDER = "test_cases_20260403_100948/test_buckets/cases"
+EXCEL_FILE = "table.xlsx"
+EXCEL_SHEET = "Sheet1"
+LEARNING_FILE = "learned_rules.json"
+LOG_FILE = "pipeline.log"
+SIMILARITY_THRESHOLD = 0.55
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
+
 ROLE_KEYWORDS = {
     "Разработчик": {
-        "алгоритм": 3, "сортировка": 3, "перепиши": 3,
-        "функцию": 2, "класс": 2, "оптимизируй": 2, "реализуй": 2,
-        "код": 1, "напиши": 1, "программа": 1
+        "алгоритм": 3, "сортировк": 3,
+        "функц": 2, "класс": 2, "метод": 2,
+        "оптимизац": 2, "реализац": 2,
+        "код": 1, "программ": 1,
+        "разработк": 2, "отладк": 2,
+        "скрипт": 1, "библиотек": 1,
+        "бэкенд": 2, "фронтенд": 2, "api": 2,
+        "рефакторинг": 2, "дебаг": 2,
+        "интеграц": 1, "деплой": 1,
     },
     "Аналитик": {
-        "sql": 3, "json": 3, "витрина": 3,
-        "запрос": 2, "отчёт": 2, "дашборд": 2, "выборка": 2,
-        "данные": 1, "отчет": 1, "анализ": 1
+        "sql": 3, "json": 3,
+        "витрин": 3, "запрос": 2,
+        "отчёт": 2, "дашборд": 2,
+        "выборк": 2, "анализ": 2,
+        "данн": 1, "метрик": 2,
+        "статистик": 2, "отчётност": 2,
+        "бизнес": 2, "показател": 2,
+        "kpi": 2, "срез": 1,
     },
     "Тестировщик": {
-        "юнит-тест": 3, "баг": 3, "тест-кейс": 3,
-        "проверь": 2, "отладка": 2, "дебаг": 2,
-        "тест": 1, "найди": 1, "ошибку": 1
+        "тест": 3, "баг": 3,
+        "ошибк": 2, "проверк": 2,
+        "автотест": 3, "дефект": 2,
+        "регресс": 2, "нагрузк": 2,
+        "юнит": 2, "интеграцион": 2,
+        "дымов": 2, "приёмочн": 2,
+        "чеклист": 2, "отладк": 1,
     }
 }
 
-# Файл для сохранения изученных правил
-LEARNING_FILE = "learned_rules.json"
-
 def load_learned_rules():
-    """Загружает изученные правила из файла"""
     if os.path.exists(LEARNING_FILE):
         with open(LEARNING_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {"keywords": {}}
 
 def save_learned_rules(rules):
-    """Сохраняет изученные правила в файл"""
     with open(LEARNING_FILE, 'w', encoding='utf-8') as f:
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
 def determine_role(description, learned_rules):
-    """Определяет роль по ключевым словам (с весами)"""
     if not description:
-        return None
-    
+        return None, []
     desc_lower = description.lower()
-    
-    # Собираем все правила (базовые + изученные)
     all_keywords = {}
     for role, keywords in ROLE_KEYWORDS.items():
         all_keywords[role] = keywords.copy()
-    
-    # Добавляем изученные правила
-    learned = learned_rules.get("keywords", {})
-    for keyword, role in learned.items():
+    for keyword, role in learned_rules.get("keywords", {}).items():
         if role not in all_keywords:
             all_keywords[role] = {}
-        all_keywords[role][keyword] = 2  # вес для изученных слов 
-        ??????????????????????????????????????????????
+        all_keywords[role][keyword] = 2
     
-    # Подсчёт очков
     scores = {}
+    matched_keywords = {}
+    
     for role, keywords in all_keywords.items():
-        score = 0
         matched = []
-        for word, weight in keywords.items():
+        score = 0
+        for word, w in keywords.items():
             if word in desc_lower:
-                score += weight
-                matched.append(f"{word}({weight})")
+                score += w
+                matched.append(word)
         if score > 0:
-            scores[role] = {"score": score, "matches": matched}
+            scores[role] = score
+            matched_keywords[role] = matched
     
     if not scores:
-        return None
+        return None, []
     
-    # Выбираем роль с максимальным счётом
-    best_role = max(scores, key=lambda r: scores[r]["score"])
-    return best_role
+    best_role = max(scores, key=scores.get)
+    matched = matched_keywords[best_role]
+    log.info(f"  роль {best_role} по словам: {matched}")
+    
+    return best_role, matched
 
-def find_similar_row(df, description, threshold=0.5):
-    """Ищет похожую строку в таблице по колонке 'Описание задачи'"""
-    if "Описание задачи" not in df.columns:
-        print("⚠️ В таблице нет колонки 'Описание задачи'")
+def llm_fallback_role(description):
+    try:
+        gigacode_path = r"C:\Users\23657203\.gigacode\bin\gigacode.ps1"
+        
+        prompt = f"Определи роль специалиста который выполняет задачу. Варианты только: Разработчик, Аналитик, Тестировщик. Ответь одним словом без пояснений.\n\nЗадача: {description[:300]}"
+        
+        result = subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", gigacode_path, prompt],
+            capture_output=True,
+            timeout=30
+        )
+
+        answer = None
+        for encoding in ['utf-8', 'cp1251', 'cp866']:
+            try:
+                answer = result.stdout.decode(encoding).strip()
+                if answer and any(role in answer for role in ["Разработчик", "Аналитик", "Тестировщик"]):
+                    break
+            except:
+                continue
+        
+        if not answer:
+            answer = result.stdout.decode('cp1251', errors='ignore').strip()
+        
+        log.info(f"gigacode ответил: {answer}")
+        
+        for role in ["Разработчик", "Аналитик", "Тестировщик"]:
+            if role in answer:
+                return role
+                
+        log.warning(f"gigacode вернул неожиданный ответ: {answer}")
+        
+    except Exception as e:
+        log.warning(f"gigacode fallback не сработал: {e}")
+    
+    return None
+
+def parse_yaml_description(content):
+    try:
+        data = yaml.safe_load(content)
+        if isinstance(data, dict):
+            for key in ["description", "instruction", "task", "scenario", "name", "title"]:
+                if key in data and isinstance(data[key], str):
+                    return data[key].strip()
+            texts = [str(v) for v in data.values() if isinstance(v, str) and len(v) > 10]
+            if texts:
+                return " ".join(texts[:3])
+    except Exception as e:
+        log.warning(f"не удалось распарсить yaml: {e}")
+    return content.strip()
+
+def clean_text(text):
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r'[^a-zа-яё0-9\s\.\,]', '', text)
+    return text.strip()
+
+def read_description(folder_path):
+    for item in sorted(os.listdir(folder_path)):
+        item_path = os.path.join(folder_path, item)
+        if os.path.isdir(item_path) and item.startswith("01_"):
+            txt_files = [f for f in os.listdir(item_path) if f.endswith(".txt")]
+            if not txt_files:
+                yaml_files = [f for f in os.listdir(item_path) if f.endswith(".yaml") or f.endswith(".yml")]
+                if yaml_files:
+                    file_path = os.path.join(item_path, yaml_files[0])
+                    with open(file_path, encoding='utf-8') as f:
+                        raw = f.read()
+                    return parse_yaml_description(raw)
+                return None
+            for file in txt_files:
+                if file.lower().endswith("task.txt"):
+                    file_path = os.path.join(item_path, file)
+                    with open(file_path, encoding='utf-8') as f:
+                        content = f.read().strip()
+                    content = clean_text(content)
+                    if "задача" in content:
+                        parts = content.split("задача", 1)
+                        result = parts[1] if len(parts) > 1 else content
+                        result = result.lstrip(':').lstrip().lstrip('\n')
+                        next_header = re.search(r'\n#{1,3}', result)
+                        if next_header:
+                            result = result[:next_header.start()]
+                        lines = result.split('\n')
+                        result = ' '.join([l for l in lines if 'важно' not in l.lower()])
+                        return result.strip()
+            for file in txt_files:
+                if file.lower().endswith("question.txt"):
+                    file_path = os.path.join(item_path, file)
+                    with open(file_path, encoding='utf-8') as f:
+                        first_line = f.readline().strip()
+                    return clean_text(first_line)
+            all_texts = []
+            for file in txt_files:
+                file_path = os.path.join(item_path, file)
+                with open(file_path, encoding='utf-8') as f:
+                    all_texts.append(f.read().strip())
+            return clean_text(" ".join(all_texts))
+    return None
+
+def find_row_by_basket(df, folder_name):
+    if "Корзины" not in df.columns:
         return None
+    for idx, row in df.iterrows():
+        cell = str(row["Корзины"]) if pd.notna(row["Корзины"]) else ""
+        if folder_name in cell:
+            return idx
+    return None
+
+def find_row_by_text(df, description, threshold=SIMILARITY_THRESHOLD):
+    if "Описание задачи" not in df.columns:
+        return None, 0
+    desc_short = description[:100].lower() if description else ""
     
     best_match = None
     best_ratio = 0
@@ -93,136 +224,151 @@ def find_similar_row(df, description, threshold=0.5):
     for idx, row in df.iterrows():
         task_desc = str(row["Описание задачи"]) if pd.notna(row["Описание задачи"]) else ""
         if not task_desc:
-            continue
+            continue 
+        task_desc_short = task_desc[:100].lower()
+        ratio = SequenceMatcher(None, desc_short, task_desc_short).ratio()
         
-        ratio = SequenceMatcher(None, description.lower(), task_desc.lower()).ratio()
         if ratio > best_ratio and ratio > threshold:
             best_ratio = ratio
             best_match = idx
     
     return best_match, best_ratio
 
-def read_description_from_folder(folder_path):
-    """Читает описание задачи из папки (ищет в 01_... или .txt)"""
-    for item in os.listdir(folder_path):
-        item_path = os.path.join(folder_path, item)
-        # Ищем папку, начинающуюся с 01_
-        if os.path.isdir(item_path) and item.startswith("01_"):
-            for file in os.listdir(item_path):
-                if file.endswith(".txt"):
-                    with open(os.path.join(item_path, file), 'r', encoding='utf-8') as f:
-                        return f.read().strip()
-    return None
-
 def add_basket_to_cell(existing, new_basket):
-    """Добавляет номер корзины в ячейку (через запятую)"""
-    if pd.isna(existing) or existing == "":
+    if pd.isna(existing) or str(existing).strip() == "":
         return new_basket
     existing_str = str(existing)
     if new_basket in existing_str:
         return existing_str
     return f"{existing_str}, {new_basket}"
 
+def learn_from_manual(description, role, learned_rules):
+    words = [w for w in description.lower().split() if len(w) > 4]
+    words = [w for w in words if w not in learned_rules["keywords"]]
+    added = 0
+    for word in words:
+        if added >= 3:
+            break
+        learned_rules["keywords"][word] = role
+        log.info(f"  запомнил: '{word}' → {role}")
+        added += 1
+    save_learned_rules(learned_rules)
+
+def save_excel_safe(df, filepath, sheet):
+    df.to_excel(filepath, index=False)
+
 def main():
+    if not os.path.exists(EXCEL_FILE):
+        log.error(f"файл {EXCEL_FILE} не найден")
+        return
+    if not os.path.exists(CASES_FOLDER):
+        log.error(f"папка {CASES_FOLDER} не найдена")
+        return
+
     df = pd.read_excel(EXCEL_FILE, sheet_name=EXCEL_SHEET)
-    print(f"Загружена таблица: {len(df)} строк")
-    
-    # Загружаем изученные правила
+    log.info(f"загружена таблица: {len(df)} строк")
+
     learned_rules = load_learned_rules()
-    print(f"Загружено изученных правил: {len(learned_rules.get('keywords', {}))}")
-    
-    # Получаем список всех папок в архиве
-    folders = [f for f in os.listdir(ARCHIVE_FOLDER) if os.path.isdir(os.path.join(ARCHIVE_FOLDER, f))]
-    print(f"Найдено папок (кейсов): {len(folders)}")
-    
-    # Статистика
-    stats = {"auto": 0, "manual": 0, "new_row": 0}
-    
-    # Обрабатываем каждую папку
+    log.info(f"загружено правил: {len(learned_rules.get('keywords', {}))}")
+
+    folders = [
+        f for f in sorted(os.listdir(CASES_FOLDER))
+        if os.path.isdir(os.path.join(CASES_FOLDER, f))
+    ]
+    log.info(f"найдено папок: {len(folders)}\n")
+
+    stats = {"auto": 0, "manual": 0, "new_row": 0, "skipped": 0, "existing": 0}
+    total = 0
+
     for i, folder_name in enumerate(folders, 1):
-        folder_path = os.path.join(ARCHIVE_FOLDER, folder_name)
-        print(f"\n[{i}/{len(folders)}] Папка: {folder_name}")
-        
-        # Читаем описание
-        description = read_description_from_folder(folder_path)
+        total = i
+        folder_path = os.path.join(CASES_FOLDER, folder_name)
+        log.info(f"[{i}/{len(folders)}] {folder_name}")
+
+        description = read_description(folder_path)
         if not description:
-            print(f"Не найдено описание задачи. Пропускаем.")
+            log.warning(f"  описание не найдено, пропускаем")
             stats["skipped"] += 1
             continue
-        print(f"Описание: {description[:100]}...")
-        
-        # Определяем роль автоматически
-        role = determine_role(description, learned_rules)
-        if role:
-            print(f"Автоопределение: {role}")
-            stats["auto"] += 1
-        else:
-            print(f"Не удалось определить роль автоматически")
-            # Спрашиваем у пользователя
-            print("\nВарианты ролей:")
-            print("      1 - Разработчик")
-            print("      2 - Аналитик")
-            print("      3 - Тестировщик")
 
-            while True:
-                choice = input("Твой выбор (1/2/3): ").strip()
-                if choice == '1':
-                    role = "Разработчик"
-                    break
-                elif choice == '2':
-                    role = "Аналитик"
-                    break
-                elif choice == '3':
-                    role = "Тестировщик"
-                    break
+        log.info(f"  описание: {description[:80]}...")
 
-            # Запоминаем новое правило
-            ??????????????????????????????????????????????????????????
-            stats["manual"] += 1
+        row_idx, ratio = find_row_by_text(df, description)
         
-        # Ищем похожую строку в таблице
-        match_idx, match_ratio = find_similar_row(df, description)
+        if row_idx is not None:
+
+            log.info(f"  найдено похожее описание (совпадение {ratio:.0%}) → строка {row_idx + 1}")
         
-        if match_idx is not None:
-            print(f"Найдена похожая строка (совпадение {match_ratio:.0%})")
-            row_idx = match_idx
+            if "Корзины" in df.columns:
+                df.at[row_idx, "Корзины"] = add_basket_to_cell(
+                    df.at[row_idx, "Корзины"], folder_name
+                )
+            
+            save_excel_safe(df, EXCEL_FILE, EXCEL_SHEET)
+            log.info(f"  добавлена корзина → {folder_name}")
+            stats["existing"] += 1
+            
         else:
-            print(f"Похожих строк не найдено. Создаём новую строку.")
-            new_row = {
-                "Описание задачи": f"New {description[:100]}",
-                "Роли для сценария": role,
-                "Корзины": folder_name
-            }
-            # Добавляем только существующие колонки
-            for col in df.columns:
-                if col not in new_row:
-                    new_row[col] = None
+            log.info(f"  похожее описание не найдено, определяем роль...")
+            
+            role, matched_keywords = determine_role(description, learned_rules)
+
+            if role and len(matched_keywords) >= 3:
+                log.info(f"  роль (авто по ключевым словам): {role} ({len(matched_keywords)} слов)")
+                stats["auto"] += 1
+                
+            elif role and len(matched_keywords) < 3:
+                log.info(f"  найдено всего {len(matched_keywords)} ключевых слов, уточняем через GigaCode")
+                gigacode_role = llm_fallback_role(description)
+                if gigacode_role:
+                    role = gigacode_role
+                else:
+                    log.info(f"  оставляем роль по ключевым словам: {role}")
+                stats["auto"] += 1
+                
+            else:
+                role = llm_fallback_role(description)
+                if role:
+                    log.info(f"  роль (GigaCode): {role}")
+                    stats["auto"] += 1
+                else:
+                    log.info("  роль не определена, спрашиваем вручную")
+                    print(f"\n[{folder_name}] выбери роль:")
+                    print("  1 - Разработчик")
+                    print("  2 - Аналитик")
+                    print("  3 - Тестировщик")
+                    while True:
+                        choice = input("  выбор (1/2/3): ").strip()
+                        if choice == '1':
+                            role = "Разработчик"
+                            break
+                        elif choice == '2':
+                            role = "Аналитик"
+                            break
+                        elif choice == '3':
+                            role = "Тестировщик"
+                            break
+                    learn_from_manual(description, role, learned_rules)
+                    stats["manual"] += 1
+
+            log.info(f"  создаём новую строку для: {folder_name}")
+            new_row = {col: None for col in df.columns}
+            new_row["Описание задачи"] = description[:100] if description else ""
+            new_row["Роли для сценария"] = role if role else ""
+            new_row["Корзины"] = folder_name
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-            row_idx = len(df) - 1
             stats["new_row"] += 1
-        
-        # Обновляем колонку "Корзины"
-        current_baskets = df.at[row_idx, "Корзины"] if "Корзины" in df.columns else ""
-        df.at[row_idx, "Корзины"] = add_basket_to_cell(current_baskets, folder_name)
-        
-        # Обновляем колонку "Роли для сценария" (если пусто)
-        if "Роли для сценария" in df.columns:
-            current_role = df.at[row_idx, "Роли для сценария"]
-            if pd.isna(current_role) or current_role == "":
-                df.at[row_idx, "Роли для сценария"] = role
-        
-        # Сохраняем после каждого кейса
-        df.to_excel(EXCEL_FILE, sheet_name=EXCEL_SHEET, index=False)
-        print(f" Сохранено в строку {row_idx + 1}")
-    
-    print(" СТАТИСТИКА ОБРАБОТКИ:")
-    print(f"Автоопределено ролей: {stats['auto']}")
-    print(f"Вручную определено ролей: {stats['manual']}")
-    print(f"Создано новых строк: {stats['new_row']}")
-    print(f"Пропущено: {stats['skipped']}")
-    print(f"Всего обработано: {i}")
-    print(f"Таблица сохранена в {EXCEL_FILE}")
-    print(f"Изученные правила сохранены в {LEARNING_FILE}")
+            
+            save_excel_safe(df, EXCEL_FILE, EXCEL_SHEET)
+            log.info(f"  сохранено\n")
+
+    log.info("готово!")
+    log.info(f"найдено совпадений: {stats['existing']}")
+    log.info(f"авто: {stats['auto']}")
+    log.info(f"вручную: {stats['manual']}")
+    log.info(f"новых строк: {stats['new_row']}")
+    log.info(f"пропущено: {stats['skipped']}")
+    log.info(f"всего: {total}")
 
 if __name__ == "__main__":
     main()
