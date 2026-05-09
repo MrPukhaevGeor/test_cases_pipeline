@@ -219,17 +219,29 @@ def get_description_04(in_dir):
     if not task_files:
         return "", ""
     content = open(task_files[0], encoding="utf-8-sig").read()
-    lines = content.splitlines()
+    content = re.sub(r'[*_#~`]', '', content)
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    
     role_text = ""
     task_text = ""
-    for line in lines:
-        clean = re.sub(r'[*_#~`]', '', line).lower().strip()
-        if 'роль' in clean and not role_text:
-            parts = clean.split('роль', 1)
-            role_text = parts[1].strip().lstrip(':* ')
-        if 'задача' in clean and not task_text:
-            parts = clean.split('задача', 1)
-            task_text = parts[1].strip().lstrip(':* ')
+    
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if 'роль' in low and not role_text:
+            after = low.split('роль', 1)[1].strip().lstrip(':')
+            if after:
+                role_text = after
+            elif i + 1 < len(lines):
+                role_text = lines[i + 1]
+        if 'задача' in low and not task_text:
+            after = low.split('задача', 1)[1].strip().lstrip(':')
+            if after:
+                task_text = after
+            elif i + 1 < len(lines):
+                task_text = lines[i + 1]
+        if role_text and task_text:
+            break
+    
     return clean_text(role_text), clean_text(task_text)
 
 def get_description_05(json_data):
