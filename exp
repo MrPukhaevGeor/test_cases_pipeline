@@ -8,7 +8,6 @@ import pandas as pd
 from pathlib import Path
 from collections import Counter
 
-# Настройки
 BASE_PATH = Path("test_buckets/cases")
 OUTPUT_FILE = "test_buckets_report.xlsx"
 LEARNING_FILE = "learned_rules.json"
@@ -24,7 +23,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Стоп-слова — не запоминаем как маркеры
 STOP_WORDS = {
     "провести", "выполнить", "обеспечить", "касательно", "согласно",
     "следующий", "необходимо", "представленных", "предложенных",
@@ -42,7 +40,7 @@ ROLE_KEYWORDS = {
         "алгоритм": 3, "сортировка": 3, "перепиши": 3, "senior": 3, "principal": 3,
         "функцию": 2, "класс": 2, "оптимизируй": 2, "реализуй": 2,
         "добавь функционал": 2, "валидацию": 2, "рефактор": 2, "ревью": 2,
-        "разработчик": 3, "разработ": 2,
+        "code review": 3, "разработчик": 3, "разработ": 2,
         "код": 1, "программа": 1, "интеграц": 1
     },
     "Аналитик (Б+С)": {
@@ -60,6 +58,19 @@ ROLE_KEYWORDS = {
         "data science": 3, "machine learning": 3, "нейросет": 3,
         "датасет": 2, "модель обуч": 2, "исследоват": 2
     }
+}
+
+DOMAIN_TO_ROLE = {
+    "code-review": "Разработчик",
+    "code-generation": "Разработчик",
+    "refactoring": "Разработчик",
+    "implementation": "Разработчик",
+    "testing": "Тестировщик",
+    "qa": "Тестировщик",
+    "analytics": "Аналитик (Б+С)",
+    "business-analytics": "Аналитик (Б+С)",
+    "data-science": "Dpeople",
+    "ml": "Dpeople"
 }
 
 def load_learned_rules():
@@ -84,20 +95,27 @@ def determine_role(text, learned_rules):
             all_kw[role] = {}
         all_kw[role][word] = 2
     scores = {}
-    total_matches = 0
     for role, kw in all_kw.items():
-        score = 0
-        for word, w in kw.items():
-            if word in t:
-                score += w
-                total_matches += 1
+        score = sum(w for word, w in kw.items() if word in t)
         if score > 0:
             scores[role] = score
     if not scores:
         return None, 0
     best = max(scores, key=scores.get)
-    confidence = scores[best]
-    return best, confidence
+    return best, scores[best]
+
+def role_from_domain(yaml_data):
+    if not isinstance(yaml_data, dict):
+        return None
+    domain = str(yaml_data.get("domain", "")).strip().lower()
+    if not domain:
+        return None
+    if domain in DOMAIN_TO_ROLE:
+        return DOMAIN_TO_ROLE[domain]
+    for key, role in DOMAIN_TO_ROLE.items():
+        if key in domain or domain in key:
+            return role
+    return None
 
 def llm_fallback_role(description, learned_rules):
     try:
@@ -126,10 +144,7 @@ def llm_fallback_role(description, learned_rules):
                                 "Ответь строго одним из: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople."
                             )
                         },
-                        {
-                            "role": "user",
-                            "content": f"Задача: {description[:500]}"
-                        }
+                        {"role": "user", "content": f"Задача: {description[:500]}"}
                     ]
                 )
                 answer = response.choices[0].message.content.strip()
@@ -152,11 +167,9 @@ def llm_fallback_role(description, learned_rules):
     return None
 
 def learn_smart(description, role, learned_rules):
-    """запоминаем редкие слова, исключая стоп-слова"""
     words = [w.strip('.,!?:;()[]') for w in description.lower().split()]
     words = [w for w in words if len(w) > 4 and w not in STOP_WORDS]
     words = [w for w in words if w not in learned_rules["keywords"]]
-    # берём редкие слова — те которые встретились 1-2 раза в тексте
     counter = Counter(words)
     rare = [w for w, c in counter.items() if c <= 2]
     for word in rare[:3]:
@@ -164,19 +177,27 @@ def learn_smart(description, role, learned_rules):
         log.info(f"  запомнил: '{word}' → {role}")
     save_learned_rules(learned_rules)
 
-def get_role(text, learned_rules, confidence_threshold=2):
-    role, confidence = determine_role(text, learned_rules)
-    # если маркеры дали уверенный ответ — используем
-    if role and confidence >= confidence_threshold:
+def get_role(text, yaml_data, learned_rules):
+    # 1. domain из yaml — самый надёжный
+    role_d = role_from_domain(yaml_data)
+    if role_d:
+        return role_d, "domain"
+
+    # 2. маркеры
+    role, conf = determine_role(text, learned_rules)
+    if role and conf >= 3:
         return role, "markers"
-    # иначе идём в LLM
-    llm_role = llm_fallback_role(text, learned_rules)
-    if llm_role:
-        return llm_role, "llm"
-    # фоллбек на маркеры даже с низкой уверенностью
+
+    # 3. LLM
+    role_llm = llm_fallback_role(text, learned_rules)
+    if role_llm:
+        return role_llm, "llm"
+
+    # 4. маркеры с низкой уверенностью
     if role:
         return role, "markers_low"
-    # совсем ничего — спрашиваем человека
+
+    # 5. ручной выбор
     print(f"\nне удалось определить роль для: {text[:80]}")
     print("1 - Разработчик\n2 - Аналитик (Б+С)\n3 - Тестировщик\n4 - Dpeople\n5 - Другие")
     while True:
@@ -197,11 +218,9 @@ def get_priority(yaml_data):
     return {"A": "0", "B": "1", "C": "2", "D": "3"}.get(cat, "")
 
 def get_scenario(yaml_data, json_data=None):
-    """определяем сценарий из yaml.instruction или json.instruction"""
     if not isinstance(yaml_data, dict):
         return "Не определено"
 
-    # собираем весь возможный текст
     parts = []
     sys_p = str(yaml_data.get("system", yaml_data.get("system_prompt", "")))
     usr_p = str(yaml_data.get("user", yaml_data.get("user_prompt", "")))
@@ -209,6 +228,9 @@ def get_scenario(yaml_data, json_data=None):
     if isinstance(instr, list):
         instr = " ".join(str(i) for i in instr)
     parts.extend([sys_p, usr_p, str(instr)])
+
+    output_type = str(yaml_data.get("output_type", "")).lower()
+    domain = str(yaml_data.get("domain", "")).lower()
 
     if "prompts" in yaml_data:
         p = yaml_data["prompts"]
@@ -220,10 +242,18 @@ def get_scenario(yaml_data, json_data=None):
 
     combined = " ".join(parts).lower()
 
+    # сначала по output_type и domain
+    if output_type == "answer" and "review" in domain:
+        return "code2structured_output"
+    if "review" in domain or "review" in combined:
+        return "code2structured_output"
+    if "refactor" in domain or "рефактор" in combined:
+        return "code2code"
+
+    # потом по содержимому
     if not combined.strip():
         return "Не определено"
-
-    if re.search(r'json|xml|yaml|csv|структурир|extract|формат вывод|структуру', combined):
+    if re.search(r'json|xml|yaml|csv|структурир|extract|формат вывод|структуру|строго валидный', combined):
         return "code2structured_output"
     if re.search(r'рефактор|оптимиз|исправ|refactor|migrate|перепиш', combined):
         return "code2code"
@@ -241,13 +271,12 @@ def clean_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 def normalize_for_grouping(text):
-    """более мягкая нормализация для группировки"""
     if not text:
         return ""
     text = text.lower()
     text = re.sub(r'[^\wа-яё\s]', ' ', text)
     words = [w for w in text.split() if len(w) > 3 and w not in STOP_WORDS]
-    return " ".join(sorted(words[:10]))  # первые 10 значимых слов
+    return " ".join(sorted(words[:10]))
 
 def load_yaml(path):
     try:
@@ -303,7 +332,6 @@ def get_description_05(json_data):
     return clean_text(instr[first + 1:second])
 
 def normalize_for_metric(text):
-    """нормализация текста для сравнения метрики"""
     if not text:
         return ""
     text = re.sub(r'[*_#~`]', '', str(text))
@@ -332,10 +360,7 @@ def calc_metric(case_type, in_dir, yaml_data):
                     content = open(ans_files[0], encoding="utf-8-sig").read()
                     a = normalize_for_metric(content)
                     b = normalize_for_metric(str(true_ans))
-                    match = a == b
-                    if match:
-                        log.info(f"  метрика: 1 (точное совпадение)")
-                    return (1 if match else 0), True
+                    return (1 if a == b else 0), True
                 except Exception:
                     pass
     return 0, False
@@ -387,7 +412,6 @@ def main():
                 if json_data:
                     lang = str(json_data.get("language", "")).strip()
 
-        # язык также можно взять из yaml
         if not lang and isinstance(yaml_data, dict):
             lang = str(yaml_data.get("language", "")).strip()
 
@@ -412,7 +436,6 @@ def main():
         if not desc:
             desc = "Без описания"
 
-        # для определения роли используем максимально полный текст
         full_text = role_text or desc
         if isinstance(yaml_data, dict):
             instr = yaml_data.get("instruction", "")
@@ -420,7 +443,7 @@ def main():
                 instr = " ".join(str(i) for i in instr)
             full_text = f"{full_text} {instr}".strip()
 
-        role, method = get_role(full_text, learned_rules)
+        role, method = get_role(full_text, yaml_data, learned_rules)
         log.info(f"  роль ({method}): {role}")
 
         priority = get_priority(yaml_data)
@@ -436,7 +459,6 @@ def main():
 
         metric_score, has_metric = calc_metric(case_type, in_dir, yaml_data)
 
-        # мягкая группировка по нормализованному описанию
         desc_normalized = normalize_for_grouping(desc)
         key = (
             role.lower(), scenario.lower(), lang.lower(),
@@ -450,7 +472,6 @@ def main():
                 "priority": priority, "metric_sum": 0.0, "has_metric": False
             }
         aggregated[key]["baskets"].append(case_dir.name)
-        # берём самое короткое описание из похожих
         if len(desc) < len(aggregated[key]["desc"]) and desc != "Без описания":
             aggregated[key]["desc"] = desc
         if has_metric:
