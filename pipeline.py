@@ -6,9 +6,9 @@ import time
 import logging
 import pandas as pd
 from pathlib import Path
+from collections import Counter
 
-# Настройки
-BASE_PATH = Path("test_buckets/cases")
+BASE_PATH = Path("test_cases/test_buckets/cases")
 OUTPUT_FILE = "test_buckets_report.xlsx"
 LEARNING_FILE = "learned_rules.json"
 LOG_FILE = "pipeline.log"
@@ -23,28 +23,54 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+STOP_WORDS = {
+    "провести", "выполнить", "обеспечить", "касательно", "согласно",
+    "следующий", "необходимо", "представленных", "предложенных",
+    "контексте", "соответствии", "результатам", "критериям", "существующий",
+    "представленном", "потенциальные", "заданным", "пользователь", "пользователя",
+    "проведи", "сформируй", "напиши", "создай", "реализуй", "добавь",
+    "который", "которая", "которые", "может", "должен", "должна",
+    "также", "затем", "после", "перед", "через", "более", "менее",
+    "очень", "просто", "всегда", "никогда", "иногда", "сейчас",
+    "хорошо", "плохо", "правильно", "неправильно"
+}
+
 ROLE_KEYWORDS = {
     "Разработчик": {
         "алгоритм": 3, "сортировка": 3, "перепиши": 3, "senior": 3, "principal": 3,
         "функцию": 2, "класс": 2, "оптимизируй": 2, "реализуй": 2,
         "добавь функционал": 2, "валидацию": 2, "рефактор": 2, "ревью": 2,
-        "код": 1, "напиши": 1, "программа": 1, "интеграц": 1, "разработ": 1
+        "code review": 3, "разработчик": 3, "разработ": 2,
+        "код": 1, "программа": 1, "интеграц": 1
     },
     "Аналитик (Б+С)": {
         "sql": 3, "витрина": 3, "бизнес-атрибут": 3, "аналитик": 3,
         "запрос": 2, "отчёт": 2, "дашборд": 2, "выборка": 2,
         "обогащение": 2, "наименован": 2, "требован": 2,
-        "данные": 1, "анализ": 1
+        "анализ": 1
     },
     "Тестировщик": {
         "юнит-тест": 3, "баг": 3, "тест-кейс": 3, "автотест": 3,
         "sql-инъекц": 2, "проверь": 2, "отладка": 2, "уязвимост": 2,
-        "тест": 1, "найди": 1, "ошибку": 1, "qa": 1
+        "тест": 1, "ошибку": 1, "qa": 2
     },
     "Dpeople": {
         "data science": 3, "machine learning": 3, "нейросет": 3,
-        "датасет": 2, "модель обуч": 2, "исследоват": 2, "выборк": 1
+        "датасет": 2, "модель обуч": 2, "исследоват": 2
     }
+}
+
+DOMAIN_TO_ROLE = {
+    "code-review": "Разработчик",
+    "code-generation": "Разработчик",
+    "refactoring": "Разработчик",
+    "implementation": "Разработчик",
+    "testing": "Тестировщик",
+    "qa": "Тестировщик",
+    "analytics": "Аналитик (Б+С)",
+    "business-analytics": "Аналитик (Б+С)",
+    "data-science": "Dpeople",
+    "ml": "Dpeople"
 }
 
 def load_learned_rules():
@@ -59,7 +85,7 @@ def save_learned_rules(rules):
 
 def determine_role(text, learned_rules):
     if not text:
-        return None
+        return None, 0
     t = text.lower()
     all_kw = {}
     for role, kw in ROLE_KEYWORDS.items():
@@ -74,19 +100,31 @@ def determine_role(text, learned_rules):
         if score > 0:
             scores[role] = score
     if not scores:
+        return None, 0
+    best = max(scores, key=scores.get)
+    return best, scores[best]
+
+def role_from_domain(yaml_data):
+    if not isinstance(yaml_data, dict):
         return None
-    return max(scores, key=scores.get)
+    domain = str(yaml_data.get("domain", "")).strip().lower()
+    if not domain:
+        return None
+    if domain in DOMAIN_TO_ROLE:
+        return DOMAIN_TO_ROLE[domain]
+    for key, role in DOMAIN_TO_ROLE.items():
+        if key in domain or domain in key:
+            return role
+    return None
 
 def llm_fallback_role(description, learned_rules):
     try:
         from zai import ZaiClient
         import httpx
-
         client = ZaiClient(
             api_key="d840f0ee19834bf89e2e1e5d73b2f679.bgW44QKU0xHBBjRx",
             http_client=httpx.Client(verify=False)
         )
-
         for attempt in range(3):
             try:
                 time.sleep(2 + attempt * 3)
@@ -97,25 +135,23 @@ def llm_fallback_role(description, learned_rules):
                             "role": "system",
                             "content": (
                                 "Ты определяешь роль IT специалиста по описанию задачи. "
-                                "Разработчик — пишет код, ревьюит, рефакторит, добавляет функционал. "
-                                "Аналитик (Б+С) — работает с данными, SQL, требованиями, бизнес-атрибутами. "
+                                "Разработчик — пишет код, ревьюит, рефакторит, добавляет функционал, делает code review. "
+                                "Аналитик (Б+С) — работает с данными, SQL, требованиями, бизнес-атрибутами, отчётами. "
                                 "Тестировщик — пишет тесты, ищет баги, проверяет уязвимости. "
                                 "Dpeople — data science, ML, нейросети. "
-                                "Другие — если не подходит ни одна роль. "
-                                "Ответь строго одним из: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople, Другие."
+                                "Если задача про код, программирование, разработку — это Разработчик. "
+                                "Не используй вариант Другие если задача связана с IT. "
+                                "Ответь строго одним из: Разработчик, Аналитик (Б+С), Тестировщик, Dpeople."
                             )
                         },
-                        {
-                            "role": "user",
-                            "content": f"Задача: {description[:500]}"
-                        }
+                        {"role": "user", "content": f"Задача: {description[:500]}"}
                     ]
                 )
                 answer = response.choices[0].message.content.strip()
                 log.info(f"  llm ответил: {answer}")
-                for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople", "Другие"]:
+                for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople"]:
                     if role in answer:
-                        learn_from_llm(description, role, learned_rules)
+                        learn_smart(description, role, learned_rules)
                         return role
                 break
             except Exception as e:
@@ -126,34 +162,42 @@ def llm_fallback_role(description, learned_rules):
                 else:
                     log.warning(f"  llm не сработал: {e}")
                     return None
-
     except Exception as e:
         log.warning(f"  llm недоступен: {e}")
     return None
 
-def learn_from_llm(description, role, learned_rules):
-    words = [w for w in description.lower().split() if len(w) > 4]
+def learn_smart(description, role, learned_rules):
+    words = [w.strip('.,!?:;()[]') for w in description.lower().split()]
+    words = [w for w in words if len(w) > 4 and w not in STOP_WORDS]
     words = [w for w in words if w not in learned_rules["keywords"]]
-    for word in words[:3]:
+    counter = Counter(words)
+    rare = [w for w, c in counter.items() if c <= 2]
+    for word in rare[:3]:
         learned_rules["keywords"][word] = role
-        log.info(f"  запомнил от llm: '{word}' → {role}")
+        log.info(f"  запомнил: '{word}' → {role}")
     save_learned_rules(learned_rules)
 
-def learn_from_manual(description, role, learned_rules):
-    words = [w for w in description.lower().split() if len(w) > 4]
-    words = [w for w in words if w not in learned_rules["keywords"]]
-    for word in words[:3]:
-        learned_rules["keywords"][word] = role
-        log.info(f"  запомнил от человека: '{word}' → {role}")
-    save_learned_rules(learned_rules)
+def get_role(text, yaml_data, learned_rules):
+    # 1. domain из yaml — самый надёжный
+    role_d = role_from_domain(yaml_data)
+    if role_d:
+        return role_d, "domain"
 
-def get_role(text, learned_rules):
-    role = determine_role(text, learned_rules)
-    if role:
+    # 2. маркеры
+    role, conf = determine_role(text, learned_rules)
+    if role and conf >= 3:
         return role, "markers"
-    role = llm_fallback_role(text, learned_rules)
+
+    # 3. LLM
+    role_llm = llm_fallback_role(text, learned_rules)
+    if role_llm:
+        return role_llm, "llm"
+
+    # 4. маркеры с низкой уверенностью
     if role:
-        return role, "llm"
+        return role, "markers_low"
+
+    # 5. ручной выбор
     print(f"\nне удалось определить роль для: {text[:80]}")
     print("1 - Разработчик\n2 - Аналитик (Б+С)\n3 - Тестировщик\n4 - Dpeople\n5 - Другие")
     while True:
@@ -164,7 +208,7 @@ def get_role(text, learned_rules):
         }
         if choice in roles:
             role = roles[choice]
-            learn_from_manual(text, role, learned_rules)
+            learn_smart(text, role, learned_rules)
             return role, "manual"
 
 def get_priority(yaml_data):
@@ -173,23 +217,49 @@ def get_priority(yaml_data):
     cat = str(yaml_data.get("testability_category", "")).strip().upper()
     return {"A": "0", "B": "1", "C": "2", "D": "3"}.get(cat, "")
 
-def get_scenario(yaml_data):
+def get_scenario(yaml_data, json_data=None):
     if not isinstance(yaml_data, dict):
         return "Не определено"
+
+    parts = []
     sys_p = str(yaml_data.get("system", yaml_data.get("system_prompt", "")))
     usr_p = str(yaml_data.get("user", yaml_data.get("user_prompt", "")))
-    if not sys_p and not usr_p and "prompts" in yaml_data:
+    instr = yaml_data.get("instruction", "")
+    if isinstance(instr, list):
+        instr = " ".join(str(i) for i in instr)
+    parts.extend([sys_p, usr_p, str(instr)])
+
+    output_type = str(yaml_data.get("output_type", "")).lower()
+    domain = str(yaml_data.get("domain", "")).lower()
+
+    if "prompts" in yaml_data:
         p = yaml_data["prompts"]
-        sys_p = str(p.get("system", p.get("system_prompt", "")))
-        usr_p = str(p.get("user", p.get("user_prompt", "")))
-    combined = f"{sys_p} {usr_p}".lower()
-    if re.search(r'json|xml|yaml|csv|структурир|extract', combined):
+        parts.append(str(p.get("system", p.get("system_prompt", ""))))
+        parts.append(str(p.get("user", p.get("user_prompt", ""))))
+
+    if json_data and isinstance(json_data, dict):
+        parts.append(str(json_data.get("instruction", "")))
+
+    combined = " ".join(parts).lower()
+
+    # сначала по output_type и domain
+    if output_type == "answer" and "review" in domain:
         return "code2structured_output"
-    if re.search(r'рефактор|оптимиз|исправ|refactor|migrate', combined):
+    if "review" in domain or "review" in combined:
+        return "code2structured_output"
+    if "refactor" in domain or "рефактор" in combined:
         return "code2code"
-    if re.search(r'напиши|сгенерируй|реализуй|write|implement', combined):
+
+    # потом по содержимому
+    if not combined.strip():
+        return "Не определено"
+    if re.search(r'json|xml|yaml|csv|структурир|extract|формат вывод|структуру|строго валидный', combined):
+        return "code2structured_output"
+    if re.search(r'рефактор|оптимиз|исправ|refactor|migrate|перепиш', combined):
+        return "code2code"
+    if re.search(r'напиши|сгенерируй|реализуй|write|implement|создай функц', combined):
         return "text2code"
-    if re.search(r'объясн|опиши|документ|ревью|explain|review|анализ', combined):
+    if re.search(r'объясн|опиши|документ|ревью|explain|review|проанализ|анализ кода', combined):
         return "code2text"
     return "Не определено"
 
@@ -199,6 +269,14 @@ def clean_text(text):
     text = re.sub(r'[*_#~`]', '', str(text))
     text = re.sub(r'[^\w\sа-яА-ЯёЁ:,\.\-\(\)\/]', '', text)
     return re.sub(r'\s+', ' ', text).strip()
+
+def normalize_for_grouping(text):
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r'[^\wа-яё\s]', ' ', text)
+    words = [w for w in text.split() if len(w) > 3 and w not in STOP_WORDS]
+    return " ".join(sorted(words[:10]))
 
 def load_yaml(path):
     try:
@@ -221,10 +299,8 @@ def get_description_04(in_dir):
     content = open(task_files[0], encoding="utf-8-sig").read()
     content = re.sub(r'[*_#~`]', '', content)
     lines = [l.strip() for l in content.splitlines() if l.strip()]
-    
     role_text = ""
     task_text = ""
-    
     for i, line in enumerate(lines):
         low = line.lower()
         if 'роль' in low and not role_text:
@@ -241,7 +317,6 @@ def get_description_04(in_dir):
                 task_text = lines[i + 1]
         if role_text and task_text:
             break
-    
     return clean_text(role_text), clean_text(task_text)
 
 def get_description_05(json_data):
@@ -250,11 +325,18 @@ def get_description_05(json_data):
         return ""
     first = instr.find('\n')
     if first == -1:
-        return ""
+        return clean_text(instr[:200])
     second = instr.find('\n', first + 1)
     if second == -1:
-        return ""
+        return clean_text(instr[first + 1:])
     return clean_text(instr[first + 1:second])
+
+def normalize_for_metric(text):
+    if not text:
+        return ""
+    text = re.sub(r'[*_#~`]', '', str(text))
+    text = re.sub(r'\s+', ' ', text).strip().lower()
+    return text
 
 def calc_metric(case_type, in_dir, yaml_data):
     if case_type in ("01", "02", "03", "06"):
@@ -276,8 +358,9 @@ def calc_metric(case_type, in_dir, yaml_data):
             if true_ans:
                 try:
                     content = open(ans_files[0], encoding="utf-8-sig").read()
-                    match = re.sub(r'\s+', ' ', content).strip().lower() == re.sub(r'\s+', ' ', str(true_ans)).strip().lower()
-                    return (1 if match else 0), True
+                    a = normalize_for_metric(content)
+                    b = normalize_for_metric(str(true_ans))
+                    return (1 if a == b else 0), True
                 except Exception:
                     pass
     return 0, False
@@ -329,6 +412,9 @@ def main():
                 if json_data:
                     lang = str(json_data.get("language", "")).strip()
 
+        if not lang and isinstance(yaml_data, dict):
+            lang = str(yaml_data.get("language", "")).strip()
+
         role_text = ""
         desc = ""
 
@@ -350,14 +436,21 @@ def main():
         if not desc:
             desc = "Без описания"
 
-        role, method = get_role(role_text or desc, learned_rules)
+        full_text = role_text or desc
+        if isinstance(yaml_data, dict):
+            instr = yaml_data.get("instruction", "")
+            if isinstance(instr, list):
+                instr = " ".join(str(i) for i in instr)
+            full_text = f"{full_text} {instr}".strip()
+
+        role, method = get_role(full_text, yaml_data, learned_rules)
         log.info(f"  роль ({method}): {role}")
 
         priority = get_priority(yaml_data)
         if role == "Другие":
             priority = ""
 
-        scenario = get_scenario(yaml_data) if yaml_data else "Нет YAML"
+        scenario = get_scenario(yaml_data, json_data)
 
         materials = ""
         md_files = list(in_dir.glob("*.md"))
@@ -366,9 +459,10 @@ def main():
 
         metric_score, has_metric = calc_metric(case_type, in_dir, yaml_data)
 
+        desc_normalized = normalize_for_grouping(desc)
         key = (
             role.lower(), scenario.lower(), lang.lower(),
-            desc.lower()[:100], materials.lower(), priority
+            desc_normalized, materials.lower(), priority
         )
 
         if key not in aggregated:
@@ -378,6 +472,8 @@ def main():
                 "priority": priority, "metric_sum": 0.0, "has_metric": False
             }
         aggregated[key]["baskets"].append(case_dir.name)
+        if len(desc) < len(aggregated[key]["desc"]) and desc != "Без описания":
+            aggregated[key]["desc"] = desc
         if has_metric:
             aggregated[key]["metric_sum"] += metric_score
             aggregated[key]["has_metric"] = True
