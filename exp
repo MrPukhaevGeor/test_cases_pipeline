@@ -7,11 +7,14 @@ import logging
 import pandas as pd
 from pathlib import Path
 from collections import Counter
+from difflib import SequenceMatcher
 
-BASE_PATH = Path("test_buckets/cases")
+BASE_PATH = Path("test_cases/test_buckets/cases")
 OUTPUT_FILE = "test_buckets_report.xlsx"
 LEARNING_FILE = "learned_rules.json"
+LLM_CACHE_FILE = "llm_cache.json"
 LOG_FILE = "pipeline.log"
+SIMILARITY_THRESHOLD = 0.7
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +86,18 @@ def save_learned_rules(rules):
     with open(LEARNING_FILE, 'w', encoding='utf-8') as f:
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
+def load_llm_cache():
+    if os.path.exists(LLM_CACHE_FILE):
+        with open(LLM_CACHE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_llm_cache(cache):
+    with open(LLM_CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+LLM_CACHE = load_llm_cache()
+
 def determine_role(text, learned_rules):
     if not text:
         return None, 0
@@ -118,6 +133,12 @@ def role_from_domain(yaml_data):
     return None
 
 def llm_fallback_role(description, learned_rules):
+    cache_key = description[:200]
+    if cache_key in LLM_CACHE:
+        cached = LLM_CACHE[cache_key]
+        log.info(f"  из кэша llm: {cached}")
+        return cached
+
     try:
         from zai import ZaiClient
         import httpx
@@ -151,6 +172,8 @@ def llm_fallback_role(description, learned_rules):
                 log.info(f"  llm ответил: {answer}")
                 for role in ["Разработчик", "Аналитик (Б+С)", "Тестировщик", "Dpeople"]:
                     if role in answer:
+                        LLM_CACHE[cache_key] = role
+                        save_llm_cache(LLM_CACHE)
                         learn_smart(description, role, learned_rules)
                         return role
                 break
@@ -178,26 +201,17 @@ def learn_smart(description, role, learned_rules):
     save_learned_rules(learned_rules)
 
 def get_role(text, yaml_data, learned_rules):
-    # 1. domain из yaml — самый надёжный
     role_d = role_from_domain(yaml_data)
     if role_d:
         return role_d, "domain"
-
-    # 2. маркеры
     role, conf = determine_role(text, learned_rules)
     if role and conf >= 3:
         return role, "markers"
-
-    # 3. LLM
     role_llm = llm_fallback_role(text, learned_rules)
     if role_llm:
         return role_llm, "llm"
-
-    # 4. маркеры с низкой уверенностью
     if role:
         return role, "markers_low"
-
-    # 5. ручной выбор
     print(f"\nне удалось определить роль для: {text[:80]}")
     print("1 - Разработчик\n2 - Аналитик (Б+С)\n3 - Тестировщик\n4 - Dpeople\n5 - Другие")
     while True:
@@ -242,7 +256,6 @@ def get_scenario(yaml_data, json_data=None):
 
     combined = " ".join(parts).lower()
 
-    # сначала по output_type и domain
     if output_type == "answer" and "review" in domain:
         return "code2structured_output"
     if "review" in domain or "review" in combined:
@@ -250,7 +263,6 @@ def get_scenario(yaml_data, json_data=None):
     if "refactor" in domain or "рефактор" in combined:
         return "code2code"
 
-    # потом по содержимому
     if not combined.strip():
         return "Не определено"
     if re.search(r'json|xml|yaml|csv|структурир|extract|формат вывод|структуру|строго валидный', combined):
@@ -269,14 +281,6 @@ def clean_text(text):
     text = re.sub(r'[*_#~`]', '', str(text))
     text = re.sub(r'[^\w\sа-яА-ЯёЁ:,\.\-\(\)\/]', '', text)
     return re.sub(r'\s+', ' ', text).strip()
-
-def normalize_for_grouping(text):
-    if not text:
-        return ""
-    text = text.lower()
-    text = re.sub(r'[^\wа-яё\s]', ' ', text)
-    words = [w for w in text.split() if len(w) > 3 and w not in STOP_WORDS]
-    return " ".join(sorted(words[:10]))
 
 def load_yaml(path):
     try:
@@ -365,6 +369,20 @@ def calc_metric(case_type, in_dir, yaml_data):
                     pass
     return 0, False
 
+def find_similar_group(aggregated, role, scenario, lang, priority, desc):
+    """ищет похожую группу по описанию через SequenceMatcher"""
+    desc_norm = re.sub(r'\s+', ' ', desc.lower()).strip()
+    for existing_key, existing_data in aggregated.items():
+        if (existing_data["role"].lower() == role.lower() and
+            existing_data["scenario"].lower() == scenario.lower() and
+            existing_data["lang"].lower() == lang.lower() and
+            existing_data["priority"] == priority):
+            existing_desc = re.sub(r'\s+', ' ', existing_data["desc"].lower()).strip()
+            ratio = SequenceMatcher(None, desc_norm, existing_desc).ratio()
+            if ratio > SIMILARITY_THRESHOLD:
+                return existing_key
+    return None
+
 def main():
     if not BASE_PATH.exists():
         log.error(f"папка {BASE_PATH} не найдена")
@@ -372,6 +390,7 @@ def main():
 
     learned_rules = load_learned_rules()
     log.info(f"загружено правил: {len(learned_rules.get('keywords', {}))}")
+    log.info(f"загружено llm кэша: {len(LLM_CACHE)}")
 
     cases = sorted([d for d in BASE_PATH.iterdir() if d.is_dir()])
     log.info(f"найдено папок: {len(cases)}")
@@ -459,24 +478,29 @@ def main():
 
         metric_score, has_metric = calc_metric(case_type, in_dir, yaml_data)
 
-        desc_normalized = normalize_for_grouping(desc)
-        key = (
-            role.lower(), scenario.lower(), lang.lower(),
-            desc_normalized, materials.lower(), priority
-        )
+        # ищем похожую группу через SequenceMatcher
+        matched_key = find_similar_group(aggregated, role, scenario, lang, priority, desc)
 
-        if key not in aggregated:
-            aggregated[key] = {
-                "baskets": [], "role": role, "scenario": scenario,
-                "lang": lang, "desc": desc, "materials": materials,
-                "priority": priority, "metric_sum": 0.0, "has_metric": False
+        if matched_key:
+            aggregated[matched_key]["baskets"].append(case_dir.name)
+            if len(desc) < len(aggregated[matched_key]["desc"]) and desc != "Без описания":
+                aggregated[matched_key]["desc"] = desc
+            if has_metric:
+                aggregated[matched_key]["metric_sum"] += metric_score
+                aggregated[matched_key]["has_metric"] = True
+        else:
+            new_key = (role.lower(), scenario.lower(), lang.lower(), desc[:50].lower(), materials.lower(), priority)
+            aggregated[new_key] = {
+                "baskets": [case_dir.name],
+                "role": role,
+                "scenario": scenario,
+                "lang": lang,
+                "desc": desc,
+                "materials": materials,
+                "priority": priority,
+                "metric_sum": metric_score if has_metric else 0.0,
+                "has_metric": has_metric
             }
-        aggregated[key]["baskets"].append(case_dir.name)
-        if len(desc) < len(aggregated[key]["desc"]) and desc != "Без описания":
-            aggregated[key]["desc"] = desc
-        if has_metric:
-            aggregated[key]["metric_sum"] += metric_score
-            aggregated[key]["has_metric"] = True
 
     rows = []
     for data in aggregated.values():
