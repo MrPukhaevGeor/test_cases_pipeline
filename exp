@@ -205,7 +205,7 @@ def get_role(text, yaml_data, learned_rules):
     if role_d:
         return role_d, "domain"
     role, conf = determine_role(text, learned_rules)
-    if role and conf >= 3:
+    if role and conf >= 6:
         return role, "markers"
     role_llm = llm_fallback_role(text, learned_rules)
     if role_llm:
@@ -282,6 +282,17 @@ def clean_text(text):
     text = re.sub(r'[^\w\sа-яА-ЯёЁ:,\.\-\(\)\/]', '', text)
     return re.sub(r'\s+', ' ', text).strip()
 
+def text_to_first_sentence(text, max_len=500):
+    """берём текст до первой точки, не дальше max_len символов"""
+    if not text:
+        return ""
+    text = re.sub(r'[*_#~`]', '', str(text))
+    text = re.sub(r'\s+', ' ', text).strip()
+    dot = text.find('.')
+    if dot != -1 and dot < max_len:
+        return text[:dot + 1].strip()
+    return text[:max_len].strip()
+
 def load_yaml(path):
     try:
         with open(path, encoding="utf-8-sig") as f:
@@ -321,19 +332,13 @@ def get_description_04(in_dir):
                 task_text = lines[i + 1]
         if role_text and task_text:
             break
-    return clean_text(role_text), clean_text(task_text)
+    return clean_text(role_text), text_to_first_sentence(task_text)
 
 def get_description_05(json_data):
     instr = str(json_data.get("instruction", "")) if json_data else ""
     if not instr:
         return ""
-    first = instr.find('\n')
-    if first == -1:
-        return clean_text(instr[:200])
-    second = instr.find('\n', first + 1)
-    if second == -1:
-        return clean_text(instr[first + 1:])
-    return clean_text(instr[first + 1:second])
+    return text_to_first_sentence(instr)
 
 def normalize_for_metric(text):
     if not text:
@@ -370,7 +375,6 @@ def calc_metric(case_type, in_dir, yaml_data):
     return 0, False
 
 def find_similar_group(aggregated, role, scenario, lang, priority, desc):
-    """ищет похожую группу по описанию через SequenceMatcher"""
     desc_norm = re.sub(r'\s+', ' ', desc.lower()).strip()
     for existing_key, existing_data in aggregated.items():
         if (existing_data["role"].lower() == role.lower() and
@@ -449,8 +453,9 @@ def main():
         else:
             txt_files = [f for f in in_dir.iterdir() if f.is_file() and f.suffix == '.txt' and 'case' in f.name.lower()]
             if txt_files:
-                desc = clean_text(open(txt_files[0], encoding="utf-8-sig").read().strip())
-                role_text = desc
+                full = clean_text(open(txt_files[0], encoding="utf-8-sig").read().strip())
+                desc = text_to_first_sentence(full)
+                role_text = full
 
         if not desc:
             desc = "Без описания"
@@ -478,7 +483,6 @@ def main():
 
         metric_score, has_metric = calc_metric(case_type, in_dir, yaml_data)
 
-        # ищем похожую группу через SequenceMatcher
         matched_key = find_similar_group(aggregated, role, scenario, lang, priority, desc)
 
         if matched_key:
