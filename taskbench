@@ -1,0 +1,48 @@
+# local_check.py
+import subprocess
+import os
+import json
+
+def run_test(test_name):
+    """Эмулирует запуск теста внутри контейнера"""
+    print(f"\n🧪 Запуск {test_name}...")
+    
+    # Создаем директорию логов как в Dockerfile
+    os.makedirs("/logs/verifier", exist_ok=True)
+    
+    if test_name == "base_do_nothing":
+        # Сценарий 1: Агент ничего не сделал → reward должен быть 0
+        # Удаляем старый результат если есть
+        if os.path.exists("/app/agent_output.json"):
+            os.remove("/app/agent_output.json")
+            
+        code = os.system("bash tests/test.sh")
+        with open("/logs/verifier/reward.txt") as f:
+            result = f.read().strip()
+            
+        assert result == "0", f"Ожидался 0, получен {result}"
+        print("✅ Base check passed: reward=0")
+
+    elif test_name == "oracle_solution":
+        # Сценарий 2: Применяем эталонное решение → reward должен быть 1
+        code = os.system("bash solution/solve.sh")
+        assert code == 0, "solve.sh завершился с ошибкой"
+        
+        code = os.system("bash tests/test.sh")
+        with open("/logs/verifier/reward.txt") as f:
+            result = f.read().strip()
+            
+        assert result == "1", f"Ожидался 1, получен {result}"
+        print("✅ Oracle check passed: reward=1")
+
+if __name__ == "__main__":
+    # Имитируем WORKDIR /app
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    
+    try:
+        run_test("base_do_nothing")
+        run_test("oracle_solution")
+        print("\n🎉 ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ! Кейс готов к сдаче.")
+    except AssertionError as e:
+        print(f"\n❌ ОШИБКА: {e}")
+        exit(1)
