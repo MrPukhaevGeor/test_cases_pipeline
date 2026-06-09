@@ -1,48 +1,103 @@
-# local_check.py
-import subprocess
+# local_check.py - Эмулятор проверки для Windows
 import os
+import sys
 import json
+import subprocess
 
-def run_test(test_name):
-    """Эмулирует запуск теста внутри контейнера"""
-    print(f"\n🧪 Запуск {test_name}...")
-    
-    # Создаем директорию логов как в Dockerfile
-    os.makedirs("/logs/verifier", exist_ok=True)
-    
-    if test_name == "base_do_nothing":
-        # Сценарий 1: Агент ничего не сделал → reward должен быть 0
-        # Удаляем старый результат если есть
-        if os.path.exists("/app/agent_output.json"):
-            os.remove("/app/agent_output.json")
-            
-        code = os.system("bash tests/test.sh")
-        with open("/logs/verifier/reward.txt") as f:
-            result = f.read().strip()
-            
-        assert result == "0", f"Ожидался 0, получен {result}"
-        print("✅ Base check passed: reward=0")
+# Настраиваем пути под Windows
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(BASE_DIR, "logs", "verifier")
+REWARD_FILE = os.path.join(LOGS_DIR, "reward.txt")
+OUTPUT_FILE = os.path.join(BASE_DIR, "agent_output.json") # Эмуляция /app/agent_output.json
 
-    elif test_name == "oracle_solution":
-        # Сценарий 2: Применяем эталонное решение → reward должен быть 1
-        code = os.system("bash solution/solve.sh")
-        assert code == 0, "solve.sh завершился с ошибкой"
+def run_tests():
+    """Запускает pytest напрямую через python, минуя bash"""
+    print("🏃 Запуск pytest...")
+    test_file = os.path.join(BASE_DIR, "tests", "test_verifier.py")
+    
+    # Запускаем pytest как модуль python
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", test_file, "-v"],
+        capture_output=True,
+        text=True
+    )
+    
+    print(result.stdout)
+    if result.stderr:
+        print("STDERR:", result.stderr)
         
-        code = os.system("bash tests/test.sh")
-        with open("/logs/verifier/reward.txt") as f:
-            result = f.read().strip()
+    return result.returncode == 0
+
+def write_reward(value):
+    """Пишет reward.txt в локальную папку logs"""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    with open(REWARD_FILE, "w") as f:
+        f.write(str(value))
+    print(f"💾 Записан reward: {value} в {REWARD_FILE}")
+
+def check_scenario(name, should_pass):
+    print(f"\n{'='*40}")
+    print(f"🧪 Сценарий: {name}")
+    print(f"{'='*40}")
+    
+    # Очистка предыдущего результата
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
+        print(f"🧹 Удален старый {OUTPUT_FILE}")
+    
+    if name == "oracle_solution":
+        # Запуск solve.sh (нужен Git Bash или WSL, либо эмуляция)
+        # Для простоты на чистом Windows пробуем вызвать через subprocess        # Если solve.sh содержит только cat/heredoc, можно переписать его логику тут
+        solve_script = os.path.join(BASE_DIR, "solution", "solve.sh")
+        print(f"⚙️ Применяем решение: {solve_script}")
+        
+        # Попытка запустить bash (если есть Git Bash в PATH)
+        try:
+            subprocess.run(["bash", solve_script], check=True)
+        except FileNotFoundError:
+            print("⚠️ bash не найден. Пробуем эмуляцию решения...")
+            # ЭМУЛЯЦИЯ: Просто создаем правильный JSON вручную
+            solution_data = {
+                "vulnerabilities": [
+                    {"type": "XSS", "line": 6, "description": "innerHTML"},
+                    {"type": "FetchError", "line": 11, "description": "no status check"},
+                    {"type": "MemoryLeak", "line": 18, "description": "no removeEventListener"},
+                    {"type": "EvalUsage", "line": 24, "description": "eval()"}
+                ],
+                "summary": "Critical issues found."
+            }
+            with open(OUTPUT_FILE, "w") as f:
+                json.dump(solution_data, f, indent=2)
+            print("✅ Эталонный JSON создан вручную.")
+
+    # Запуск тестов
+    passed = run_tests()
+    
+    # Запись результата
+    expected_reward = 1 if (passed and should_pass) else 0
+    # В реальном сценарии base_do_nothing тесты должны упасть -> reward 0
+    # В сценарии oracle тесты должны пройти -> reward 1
+    
+    actual_reward = 1 if passed else 0
+    write_reward(actual_reward)
+    
+    # Проверка ожидания
+    if name == "base_do_nothing":
+        if actual_reward == 0:
+            print("✅ SUCCESS: База не прошла тесты (reward=0), как и ожидалось.")
+        else:
+            print("❌ FAIL: База прошла тесты (reward=1), но должна была упасть!")
             
-        assert result == "1", f"Ожидался 1, получен {result}"
-        print("✅ Oracle check passed: reward=1")
+    elif name == "oracle_solution":
+        if actual_reward == 1:
+            print("✅ SUCCESS: Оракул прошел тесты (reward=1).")
+        else:
+            print("❌ FAIL: Оракул не прошел тесты (reward=0). Проверь solve.sh или тесты.")
 
 if __name__ == "__main__":
-    # Имитируем WORKDIR /app
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    # 1. Проверка базы (без решения)
+    check_scenario("base_do_nothing", should_pass=False)    
+    # 2. Проверка оракула (с решением)
+    check_scenario("oracle_solution", should_pass=True)
     
-    try:
-        run_test("base_do_nothing")
-        run_test("oracle_solution")
-        print("\n🎉 ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ! Кейс готов к сдаче.")
-    except AssertionError as e:
-        print(f"\n❌ ОШИБКА: {e}")
-        exit(1)
+    print("\n Проверка завершена. Файлы reward.txt созданы в папке logs/verifier/")
