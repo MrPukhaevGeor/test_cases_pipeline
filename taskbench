@@ -78,7 +78,42 @@ def run_scenario(name, apply_solution=False):
         reward = 0
 
     # Запись результата
+    # ... (предыдущий код)
+    
+    # Запись результата
     os.makedirs(LOGS_DIR, exist_ok=True)
     with open(REWARD_FILE, "w") as f:
         f.write(str(reward))
-    print(f
+    print(f"💾 Записан reward: {reward} в {REWARD_FILE}")
+    return reward
+
+if __name__ == "__main__":
+    print("🚀 Запуск автономной проверки кейса b2c_case_04_09...")
+    
+    # 1. Проверка базы (без решения) -> Ожидаем reward=0
+    r1 = run_scenario("base_do_nothing", apply_solution=False)
+    
+    # 2. Проверка оракула (с решением) -> Ожидаем reward=1
+    r2 = run_scenario("oracle_solution", apply_solution=True)
+    
+    print("\n" + "="*50)
+    print(" ИТОГИ ПРОВЕРКИ:")
+    print("="*50)
+    
+    success = True
+    if r1 != 0:
+        print("❌ FAIL: База должна давать reward=0, но дала", r1)
+        success = False
+    else:
+        print("✅ PASS: База корректно не прошла проверку (reward=0)")
+        
+    if r2 != 1:
+        print("❌ FAIL: Оракул должен давать reward=1, но дал", r2)
+        success = False
+    else:
+        print("✅ PASS: Оракул успешно прошел проверку (reward=1)")
+        
+    if success:
+        print("\n🎉 ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ! Кейс готов к сдаче.")
+    else:
+        print("\n️ Есть ошибки. Проверь логи выше.")
