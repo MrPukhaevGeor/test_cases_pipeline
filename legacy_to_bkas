@@ -1,0 +1,703 @@
+
+import os
+import re
+import json
+import yaml
+import shutil
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+# Пути
+SOURCE_BASE = Path("")
+OUTPUT_BASE = Path("bkas_ready_cases")
+
+class LegacyToBkasConverter:
+    def __init__(self):
+        self.template_counter = 0
+
+    def extract_language(self, context_text: str) -> str:
+        """Определяет язык программирования по коду"""
+        if 'import asyncio' in context_text or 'def ' in context_text or 'import decimal' in context_text:
+            return 'python'
+        elif 'function ' in context_text or 'const ' in context_text or 'async function' in context_text:
+            return 'javascript'
+        elif 'pub fn ' in context_text or '-> Option<' in context_text:
+            return 'rust'
+        elif 'public class' in context_text or 'public static' in context_text:
+            return 'java'
+        elif 'func ' in context_text and 'package ' in context_text:
+            return 'go'
+        return 'python'  # default
+
+    def get_main_filename(self, language: str) -> str:
+        """Возвращает имя файла по языку"""
+        extensions = {
+            'python': 'main.py',
+            'javascript': 'main.js',
+            'rust': 'main.rs',
+            'java': 'Main.java',
+            'go': 'main.go'
+        }
+        return extensions.get(language, 'main.txt')
+
+    def parse_yaml_metadata(self, yaml_path: Path) -> Dict[str, Any]:
+        """Парсит case.yaml"""
+        if not yaml_path.exists():
+            return {}
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+
+    def extract_json_from_answer(self, answer_path: Path) -> Optional[Dict]:
+        """Извлекает JSON из эталонного ответа (если есть)"""
+        if not answer_path.exists():
+            return None
+
+        content = answer_path.read_text(encoding='utf-8-sig')
+
+        # Ищем JSON в тексте
+        json_match = re.search(r'\{[\s\S]*\}', content)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    def clean_json_keys(self, data: Any) -> Any:
+        """Удаляет trailing spaces из ключей JSON"""
+        if isinstance(data, dict):
+            return {k.strip(): self.clean_json_keys(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self.clean_json_keys(item) for item in data]
+        return data
+
+    def generate_instruction(self, task_path: Path, yaml_data: Dict) -> str:
+        """Генерирует instruction.md"""
+        if not task_path.exists():
+            return "# Task Description\n\nSee task.toml for details."
+
+        content = task_path.read_text(encoding='utf-8-sig')
+
+        # Если есть системный промпт в YAML, используем его
+        if 'instruction' in yaml_data:
+            instr = yaml_data['instruction']
+            if isinstance(instr, str):
+                # Очищаем от экранирования
+                instr = instr.replace('\\n', '\n').replace('\\"', '"')
+                return f"# Task Instruction\n\n{instr}"
+
+        # Иначе берем из файла
+        lines = content.strip().split('\n')
+        clean_lines = []
+        for line in lines:
+            # Убираем маркеры [System], [User]
+            if line.startswith('[') and ']' in line:
+                continue
+            clean_lines.append(line)
+
+        return "\n".join(clean_lines)
+
+    def generate_dockerfile(self, language: str, main_file: str) -> str:
+        """Генерирует Dockerfile"""
+        if language == 'python':
+            return f"""FROM python:3.10-slim
+WORKDIR /app
+COPY repo/{main_file} .
+RUN pip install --no-cache-dir pytest
+RUN mkdir -p /logs/verifier
+"""
+        elif language == 'javascript':
+            return f"""FROM python:3.10-slim
+WORKDIR /app
+COPY repo/{main_file} .
+RUN pip install --no-cache-dir pytest
+RUN mkdir -p /logs/verifier
+"""
+        else:
+            return f"""FROM python:3.10-slim
+WORKDIR /app
+COPY repo/{main_file} .
+RUN pip install --no-cache-dir pytest
+RUN mkdir -p /logs/verifier
+"""
+
+    def generate_solve_sh(self, answer_path: Path, language: str) -> str:
+        """Генерирует solve.sh на основе эталонного ответа"""
+        if not answer_path.exists():
+            return '#!/bin/bash\necho "No solution provided"\n'
+
+        content = answer_path.read_text(encoding='utf-8-sig')
+
+        # Для аналитических задач генерируем JSON
+        solve_script = """#!/bin/bash
+cat > /app/agent_output.json << 'EOF'
+{
+  "analysis": {
+    "summary": "Code review completed",
+    "issues": [
+"""
+
+        # Парсим issues из эталонного ответа
+        issues = re.findall(r'(\d+)\.\s+\*\*(.+?)\*\*[:\s]+(.+?)(?=\d+\.|$)', content, re.DOTALL)
+
+        issue_entries = []
+        for line_num, title, desc in issues:
+            # Очищаем текст
+            title = title.strip()
+            desc = re.sub(r'\*\*.*?\*\*', '', desc).strip()
+            desc = desc.replace('\n', ' ').replace('"', "'")
+
+            issue_entries.append(f"""      {{
+        "type": "{title.split()[0] if title else 'Issue'}",
+        "line": {line_num},
+        "description": "{desc[:100]}"
+      }}""")
+
+        solve_script += ",\n".join(issue_entries)
+        solve_script += """
+    ]
+  }
+}
+EOF
+"""
+        return solve_script
+
+    def generate_test_verifier(self, answer_path: Path, language: str) -> str:
+        """Генерирует test_verifier.py"""
+        test_code = """import json
+import os
+import pytest
+
+@pytest.fixture
+def resp():
+    if not os.path.exists("/app/agent_output.json"):
+        pytest.skip("No agent output found")
+    with open("/app/agent_output.json") as f:
+        return json.load(f)
+
+def test_structure(resp):
+    assert isinstance(resp, dict)
+    assert "analysis" in resp or "review_summary" in resp or "issues" in resp
+
+"""
+
+        # Добавляем специфичные тесты на основе эталона
+        if answer_path.exists():
+            content = answer_path.read_text(encoding='utf-8-sig')
+
+            # Ищем ключевые слова для тестов
+            if 'race condition' in content.lower() or 'гонк' in content.lower():
+                test_code += """
+def test_race_condition_detected(resp):
+    text = json.dumps(resp).lower()
+    assert any(kw in text for kw in ['race', 'lock', 'concurrent', 'asyncio'])
+
+"""
+            if 'precision' in content.lower() or 'точност' in content.lower() or 'decimal' in content.lower():
+                test_code += """
+def test_precision_issue_detected(resp):
+    text = json.dumps(resp).lower()
+    assert any(kw in text for kw in ['decimal', 'precision', 'float', 'round'])
+
+"""
+            if 'retry' in content.lower() or 'timeout' in content.lower():
+                test_code += """
+def test_retry_timeout_detected(resp):
+    text = json.dumps(resp).lower()
+    assert any(kw in text for kw in ['retry', 'timeout', 'resilience', 'failure'])
+
+"""
+
+        return test_code
+
+    def generate_test_sh(self) -> str:
+        """Генерирует test.sh"""
+        return """#!/bin/bash
+cd /app
+pytest /tests/test_verifier.py -v
+if [ $? -eq 0 ]; then
+    echo 1 > /logs/verifier/reward.txt
+else
+    echo 0 > /logs/verifier/reward.txt
+fi
+"""
+
+    def generate_task_toml(self, case_name: str, yaml_data: Dict, language: str) -> str:
+        """Генерирует task.toml"""
+        domain = yaml_data.get('domain', 'code-review')
+        difficulty = yaml_data.get('complexity', yaml_data.get('difficulty', 'medium'))
+        category = yaml_data.get('testability_category', 'C')
+
+        return f"""[task]
+name = "b2c/{case_name}"
+description = "Code review task for {language} in {domain} domain"
+authors = [{{name = "auto-generated", email = "auto@sber.ru"}}]
+
+[metadata]
+task_type = "agentic"
+bank_domain = "{domain}"
+language = "{language}"
+build_tool = "pip"
+difficulty = "{difficulty}"
+source = "legacy-migration"
+team = "auto-generated"
+anti_cheat = ["ответ должен быть валидным JSON", "не использовать free-text"]
+fail_to_pass = ["test_structure"]
+pass_to_pass = ["test_structure"]
+
+[agent]
+timeout_sec = 300.0
+
+[verifier]
+timeout_sec = 60.0
+
+root_schema_version = "1.1"
+"""
+
+    def convert_case(self, case_dir: Path):
+        """Конвертирует один кейс"""
+        case_name = case_dir.name
+        print(f"🔄 Конвертация: {case_name}")
+
+        # Пути к исходным файлам
+        in_dir = case_dir / "01_in"
+        int_dir = case_dir / "02_intermediate"
+        out_dir = case_dir / "03_out"
+
+        # Ищем файлы
+        task_file = next((f for f in in_dir.glob("*task*.txt") if f.is_file()), None)
+        context_file = next((f for f in in_dir.glob("*context*.txt") if f.is_file()), None)
+        answer_file = next((f for f in in_dir.glob("*answer*.txt") if f.is_file()), None)
+        yaml_file = next((f for f in int_dir.glob("*.yaml") if f.is_file()), None) if int_dir.exists() else None
+
+        # Читаем метаданные
+        yaml_data = self.parse_yaml_metadata(yaml_file) if yaml_file else {}
+
+        # Читаем код
+        if not context_file or not context_file.exists():
+            print(f"  ⚠️  Нет файла контекста, пропускаем")
+            return
+
+        code = context_file.read_text(encoding='utf-8-sig')
+
+        # Определяем язык
+        language = self.extract_language(code)
+        main_file = self.get_main_filename(language)
+
+        # Создаем выходную структуру
+        out_path = OUTPUT_BASE / case_name
+        for sub in ["environment/repo", "solution", "tests"]:
+            (out_path / sub).mkdir(parents=True, exist_ok=True)
+
+        # 1. Копируем код
+        (out_path / "environment" / "repo" / main_file).write_text(code, encoding='utf-8')
+
+        # 2. Генерируем instruction.md
+        instruction = self.generate_instruction(task_file, yaml_data)
+        (out_path / "instruction.md").write_text(instruction, encoding='utf-8')
+
+        # 3. Генерируем Dockerfile
+        dockerfile = self.generate_dockerfile(language, main_file)
+        (out_path / "environment" / "Dockerfile").write_text(dockerfile, encoding='utf-8')
+
+        # 4. Генерируем solve.sh
+        solve_script = self.generate_solve_sh(answer_file, language)
+        solve_path = out_path / "solution" / "solve.sh"
+        solve_path.write_text(solve_script, encoding='utf-8')
+        os.chmod(solve_path, 0o755)
+
+        # 5. Генерируем тесты
+        test_py = self.generate_test_verifier(answer_file, language)
+        (out_path / "tests" / "test_verifier.py").write_text(test_py, encoding='utf-8')
+
+        test_sh = self.generate_test_sh()
+        test_sh_path = out_path / "tests" / "test.sh"
+        test_sh_path.write_text(test_sh, encoding='utf-8')
+        os.chmod(test_sh_path, 0o755)
+
+        # 6. Генерируем task.toml
+        toml_content = self.generate_task_toml(case_name, yaml_data, language)
+        (out_path / "task.toml").write_text(toml_content, encoding='utf-8')
+
+        print(f"  ✅ Готово: {out_path}")
+
+    def run(self):
+        """Запускает конвертацию всех кейсов"""
+        if not SOURCE_BASE.exists():
+            print(f"❌ Папка {SOURCE_BASE} не найдена")
+            return
+
+        # Создаем выходную папку
+        OUTPUT_BASE.mkdir(exist_ok=True)
+
+        # Находим все кейсы
+        cases = sorted([d for d in SOURCE_BASE.iterdir() if d.is_dir() and 'case' in d.name])
+        print(f"📦 Найдено кейсов: {len(cases)}")
+
+        for case in cases:
+            try:
+                self.convert_case(case)
+            except Exception as e:
+                print(f"  ❌ Ошибка в {case.name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        print(f"\n🎉 Конвертация завершена! Кейсы в: {OUTPUT_BASE}")
+
+if __name__ == "__main__":
+    converter = LegacyToBkasConverter()
+    converter.run()
+import os
+import re
+import json
+import yaml
+import shutil
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+# Пути
+SOURCE_BASE = Path("")
+OUTPUT_BASE = Path("bkas_ready_cases")
+
+class LegacyToBkasConverter:
+    def __init__(self):
+        self.template_counter = 0
+
+    def extract_language(self, context_text: str) -> str:
+        """Определяет язык программирования по коду"""
+        if 'import asyncio' in context_text or 'def ' in context_text or 'import decimal' in context_text:
+            return 'python'
+        elif 'function ' in context_text or 'const ' in context_text or 'async function' in context_text:
+            return 'javascript'
+        elif 'pub fn ' in context_text or '-> Option<' in context_text:
+            return 'rust'
+        elif 'public class' in context_text or 'public static' in context_text:
+            return 'java'
+        elif 'func ' in context_text and 'package ' in context_text:
+            return 'go'
+        return 'python'  # default
+
+    def get_main_filename(self, language: str) -> str:
+        """Возвращает имя файла по языку"""
+        extensions = {
+            'python': 'main.py',
+            'javascript': 'main.js',
+            'rust': 'main.rs',
+            'java': 'Main.java',
+            'go': 'main.go'
+        }
+        return extensions.get(language, 'main.txt')
+
+    def parse_yaml_metadata(self, yaml_path: Path) -> Dict[str, Any]:
+        """Парсит case.yaml"""
+        if not yaml_path.exists():
+            return {}
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+
+    def extract_json_from_answer(self, answer_path: Path) -> Optional[Dict]:
+        """Извлекает JSON из эталонного ответа (если есть)"""
+        if not answer_path.exists():
+            return None
+
+        content = answer_path.read_text(encoding='utf-8-sig')
+
+        # Ищем JSON в тексте
+        json_match = re.search(r'\{[\s\S]*\}', content)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    def clean_json_keys(self, data: Any) -> Any:
+        """Удаляет trailing spaces из ключей JSON"""
+        if isinstance(data, dict):
+            return {k.strip(): self.clean_json_keys(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self.clean_json_keys(item) for item in data]
+        return data
+
+    def generate_instruction(self, task_path: Path, yaml_data: Dict) -> str:
+        """Генерирует instruction.md"""
+        if not task_path.exists():
+            return "# Task Description\n\nSee task.toml for details."
+
+        content = task_path.read_text(encoding='utf-8-sig')
+
+        # Если есть системный промпт в YAML, используем его
+        if 'instruction' in yaml_data:
+            instr = yaml_data['instruction']
+            if isinstance(instr, str):
+                # Очищаем от экранирования
+                instr = instr.replace('\\n', '\n').replace('\\"', '"')
+                return f"# Task Instruction\n\n{instr}"
+
+        # Иначе берем из файла
+        lines = content.strip().split('\n')
+        clean_lines = []
+        for line in lines:
+            # Убираем маркеры [System], [User]
+            if line.startswith('[') and ']' in line:
+                continue
+            clean_lines.append(line)
+
+        return "\n".join(clean_lines)
+
+    def generate_dockerfile(self, language: str, main_file: str) -> str:
+        """Генерирует Dockerfile"""
+        if language == 'python':
+            return f"""FROM python:3.10-slim
+WORKDIR /app
+COPY repo/{main_file} .
+RUN pip install --no-cache-dir pytest
+RUN mkdir -p /logs/verifier
+"""
+        elif language == 'javascript':
+            return f"""FROM python:3.10-slim
+WORKDIR /app
+COPY repo/{main_file} .
+RUN pip install --no-cache-dir pytest
+RUN mkdir -p /logs/verifier
+"""
+        else:
+            return f"""FROM python:3.10-slim
+WORKDIR /app
+COPY repo/{main_file} .
+RUN pip install --no-cache-dir pytest
+RUN mkdir -p /logs/verifier
+"""
+
+    def generate_solve_sh(self, answer_path: Path, language: str) -> str:
+        """Генерирует solve.sh на основе эталонного ответа"""
+        if not answer_path.exists():
+            return '#!/bin/bash\necho "No solution provided"\n'
+
+        content = answer_path.read_text(encoding='utf-8-sig')
+
+        # Для аналитических задач генерируем JSON
+        solve_script = """#!/bin/bash
+cat > /app/agent_output.json << 'EOF'
+{
+  "analysis": {
+    "summary": "Code review completed",
+    "issues": [
+"""
+
+        # Парсим issues из эталонного ответа
+        issues = re.findall(r'(\d+)\.\s+\*\*(.+?)\*\*[:\s]+(.+?)(?=\d+\.|$)', content, re.DOTALL)
+
+        issue_entries = []
+        for line_num, title, desc in issues:
+            # Очищаем текст
+            title = title.strip()
+            desc = re.sub(r'\*\*.*?\*\*', '', desc).strip()
+            desc = desc.replace('\n', ' ').replace('"', "'")
+
+            issue_entries.append(f"""      {{
+        "type": "{title.split()[0] if title else 'Issue'}",
+        "line": {line_num},
+        "description": "{desc[:100]}"
+      }}""")
+
+        solve_script += ",\n".join(issue_entries)
+        solve_script += """
+    ]
+  }
+}
+EOF
+"""
+        return solve_script
+
+    def generate_test_verifier(self, answer_path: Path, language: str) -> str:
+        """Генерирует test_verifier.py"""
+        test_code = """import json
+import os
+import pytest
+
+@pytest.fixture
+def resp():
+    if not os.path.exists("/app/agent_output.json"):
+        pytest.skip("No agent output found")
+    with open("/app/agent_output.json") as f:
+        return json.load(f)
+
+def test_structure(resp):
+    assert isinstance(resp, dict)
+    assert "analysis" in resp or "review_summary" in resp or "issues" in resp
+
+"""
+
+        # Добавляем специфичные тесты на основе эталона
+        if answer_path.exists():
+            content = answer_path.read_text(encoding='utf-8-sig')
+
+            # Ищем ключевые слова для тестов
+            if 'race condition' in content.lower() or 'гонк' in content.lower():
+                test_code += """
+def test_race_condition_detected(resp):
+    text = json.dumps(resp).lower()
+    assert any(kw in text for kw in ['race', 'lock', 'concurrent', 'asyncio'])
+
+"""
+            if 'precision' in content.lower() or 'точност' in content.lower() or 'decimal' in content.lower():
+                test_code += """
+def test_precision_issue_detected(resp):
+    text = json.dumps(resp).lower()
+    assert any(kw in text for kw in ['decimal', 'precision', 'float', 'round'])
+
+"""
+            if 'retry' in content.lower() or 'timeout' in content.lower():
+                test_code += """
+def test_retry_timeout_detected(resp):
+    text = json.dumps(resp).lower()
+    assert any(kw in text for kw in ['retry', 'timeout', 'resilience', 'failure'])
+
+"""
+
+        return test_code
+
+    def generate_test_sh(self) -> str:
+        """Генерирует test.sh"""
+        return """#!/bin/bash
+cd /app
+pytest /tests/test_verifier.py -v
+if [ $? -eq 0 ]; then
+    echo 1 > /logs/verifier/reward.txt
+else
+    echo 0 > /logs/verifier/reward.txt
+fi
+"""
+
+    def generate_task_toml(self, case_name: str, yaml_data: Dict, language: str) -> str:
+        """Генерирует task.toml"""
+        domain = yaml_data.get('domain', 'code-review')
+        difficulty = yaml_data.get('complexity', yaml_data.get('difficulty', 'medium'))
+        category = yaml_data.get('testability_category', 'C')
+
+        return f"""[task]
+name = "b2c/{case_name}"
+description = "Code review task for {language} in {domain} domain"
+authors = [{{name = "auto-generated", email = "auto@sber.ru"}}]
+
+[metadata]
+task_type = "agentic"
+bank_domain = "{domain}"
+language = "{language}"
+build_tool = "pip"
+difficulty = "{difficulty}"
+source = "legacy-migration"
+team = "auto-generated"
+anti_cheat = ["ответ должен быть валидным JSON", "не использовать free-text"]
+fail_to_pass = ["test_structure"]
+pass_to_pass = ["test_structure"]
+
+[agent]
+timeout_sec = 300.0
+
+[verifier]
+timeout_sec = 60.0
+
+root_schema_version = "1.1"
+"""
+
+    def convert_case(self, case_dir: Path):
+        """Конвертирует один кейс"""
+        case_name = case_dir.name
+        print(f"🔄 Конвертация: {case_name}")
+
+        # Пути к исходным файлам
+        in_dir = case_dir / "01_in"
+        int_dir = case_dir / "02_intermediate"
+        out_dir = case_dir / "03_out"
+
+        # Ищем файлы
+        task_file = next((f for f in in_dir.glob("*task*.txt") if f.is_file()), None)
+        context_file = next((f for f in in_dir.glob("*context*.txt") if f.is_file()), None)
+        answer_file = next((f for f in in_dir.glob("*answer*.txt") if f.is_file()), None)
+        yaml_file = next((f for f in int_dir.glob("*.yaml") if f.is_file()), None) if int_dir.exists() else None
+
+        # Читаем метаданные
+        yaml_data = self.parse_yaml_metadata(yaml_file) if yaml_file else {}
+
+        # Читаем код
+        if not context_file or not context_file.exists():
+            print(f"  ⚠️  Нет файла контекста, пропускаем")
+            return
+
+        code = context_file.read_text(encoding='utf-8-sig')
+
+        # Определяем язык
+        language = self.extract_language(code)
+        main_file = self.get_main_filename(language)
+
+        # Создаем выходную структуру
+        out_path = OUTPUT_BASE / case_name
+        for sub in ["environment/repo", "solution", "tests"]:
+            (out_path / sub).mkdir(parents=True, exist_ok=True)
+
+        # 1. Копируем код
+        (out_path / "environment" / "repo" / main_file).write_text(code, encoding='utf-8')
+
+        # 2. Генерируем instruction.md
+        instruction = self.generate_instruction(task_file, yaml_data)
+        (out_path / "instruction.md").write_text(instruction, encoding='utf-8')
+
+        # 3. Генерируем Dockerfile
+        dockerfile = self.generate_dockerfile(language, main_file)
+        (out_path / "environment" / "Dockerfile").write_text(dockerfile, encoding='utf-8')
+
+        # 4. Генерируем solve.sh
+        solve_script = self.generate_solve_sh(answer_file, language)
+        solve_path = out_path / "solution" / "solve.sh"
+        solve_path.write_text(solve_script, encoding='utf-8')
+        os.chmod(solve_path, 0o755)
+
+        # 5. Генерируем тесты
+        test_py = self.generate_test_verifier(answer_file, language)
+        (out_path / "tests" / "test_verifier.py").write_text(test_py, encoding='utf-8')
+
+        test_sh = self.generate_test_sh()
+        test_sh_path = out_path / "tests" / "test.sh"
+        test_sh_path.write_text(test_sh, encoding='utf-8')
+        os.chmod(test_sh_path, 0o755)
+
+        # 6. Генерируем task.toml
+        toml_content = self.generate_task_toml(case_name, yaml_data, language)
+        (out_path / "task.toml").write_text(toml_content, encoding='utf-8')
+
+        print(f"  ✅ Готово: {out_path}")
+
+    def run(self):
+        """Запускает конвертацию всех кейсов"""
+        if not SOURCE_BASE.exists():
+            print(f"❌ Папка {SOURCE_BASE} не найдена")
+            return
+
+        # Создаем выходную папку
+        OUTPUT_BASE.mkdir(exist_ok=True)
+
+        # Находим все кейсы
+        cases = sorted([d for d in SOURCE_BASE.iterdir() if d.is_dir() and 'case' in d.name])
+        print(f"📦 Найдено кейсов: {len(cases)}")
+
+        for case in cases:
+            try:
+                self.convert_case(case)
+            except Exception as e:
+                print(f"  ❌ Ошибка в {case.name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        print(f"\n🎉 Конвертация завершена! Кейсы в: {OUTPUT_BASE}")
+
+if __name__ == "__main__":
+    converter = LegacyToBkasConverter()
+    converter.run()
