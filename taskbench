@@ -1,103 +1,84 @@
-# local_check.py - Эмулятор проверки для Windows
+# local_check.py - Автономная проверка БЕЗ pytest и Docker
 import os
 import sys
 import json
-import subprocess
 
-# Настраиваем пути под Windows
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "logs", "verifier")
 REWARD_FILE = os.path.join(LOGS_DIR, "reward.txt")
-OUTPUT_FILE = os.path.join(BASE_DIR, "agent_output.json") # Эмуляция /app/agent_output.json
+OUTPUT_FILE = os.path.join(BASE_DIR, "agent_output.json")
 
-def run_tests():
-    """Запускает pytest напрямую через python, минуя bash"""
-    print("🏃 Запуск pytest...")
-    test_file = os.path.join(BASE_DIR, "tests", "test_verifier.py")
+def validate_json_structure(data):
+    """Pass-to-Pass: Проверка формата"""
+    assert isinstance(data, dict), "Ответ должен быть словарем"
+    assert "vulnerabilities" in data, "Нет ключа vulnerabilities"
+    assert isinstance(data["vulnerabilities"], list), "vulnerabilities должен быть списком"
+    assert "summary" in data, "Нет ключа summary"
+    return True
+
+def validate_content(data):
+    """Fail-to-Pass: Проверка содержания"""
+    vulns = data.get("vulnerabilities", [])
+    types = [v.get("type") for v in vulns]
     
-    # Запускаем pytest как модуль python
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", test_file, "-v"],
-        capture_output=True,
-        text=True
-    )
-    
-    print(result.stdout)
-    if result.stderr:
-        print("STDERR:", result.stderr)
+    errors = []
+    if "XSS" not in types: errors.append("Не найдена XSS")
+    if "EvalUsage" not in types: errors.append("Не найден EvalUsage")
+    if "FetchError" not in types and not any("status" in str(v).lower() for v in vulns): 
+        errors.append("Не найдена ошибка Fetch/Status")
         
-    return result.returncode == 0
+    if errors:
+        raise AssertionError(f"Критические уязвимости не найдены: {', '.join(errors)}")
+    return True
 
-def write_reward(value):
-    """Пишет reward.txt в локальную папку logs"""
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    with open(REWARD_FILE, "w") as f:
-        f.write(str(value))
-    print(f"💾 Записан reward: {value} в {REWARD_FILE}")
-
-def check_scenario(name, should_pass):
-    print(f"\n{'='*40}")
+def run_scenario(name, apply_solution=False):
+    print(f"\n{'='*50}")
     print(f"🧪 Сценарий: {name}")
-    print(f"{'='*40}")
+    print(f"{'='*50}")
     
-    # Очистка предыдущего результата
+    # Очистка
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
-        print(f"🧹 Удален старый {OUTPUT_FILE}")
     
-    if name == "oracle_solution":
-        # Запуск solve.sh (нужен Git Bash или WSL, либо эмуляция)
-        # Для простоты на чистом Windows пробуем вызвать через subprocess        # Если solve.sh содержит только cat/heredoc, можно переписать его логику тут
-        solve_script = os.path.join(BASE_DIR, "solution", "solve.sh")
-        print(f"⚙️ Применяем решение: {solve_script}")
-        
-        # Попытка запустить bash (если есть Git Bash в PATH)
-        try:
-            subprocess.run(["bash", solve_script], check=True)
-        except FileNotFoundError:
-            print("⚠️ bash не найден. Пробуем эмуляцию решения...")
-            # ЭМУЛЯЦИЯ: Просто создаем правильный JSON вручную
-            solution_data = {
-                "vulnerabilities": [
-                    {"type": "XSS", "line": 6, "description": "innerHTML"},
-                    {"type": "FetchError", "line": 11, "description": "no status check"},
-                    {"type": "MemoryLeak", "line": 18, "description": "no removeEventListener"},
-                    {"type": "EvalUsage", "line": 24, "description": "eval()"}
-                ],
-                "summary": "Critical issues found."
-            }
-            with open(OUTPUT_FILE, "w") as f:
-                json.dump(solution_data, f, indent=2)
-            print("✅ Эталонный JSON создан вручную.")
+    # Применение решения (эмуляция solve.sh)
+    if apply_solution:
+        print("⚙️ Применяем эталонное решение...")
+        solution_data = {
+            "vulnerabilities": [
+                {"type": "XSS", "line": 6, "description": "innerHTML"},
+                {"type": "FetchError", "line": 11, "description": "no status check"},
+                {"type": "MemoryLeak", "line": 18, "description": "no removeEventListener"},
+                {"type": "EvalUsage", "line": 24, "description": "eval()"}
+            ],
+            "summary": "Critical issues found."
+        }
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(solution_data, f, ensure_ascii=False, indent=2)
+        print("✅ Эталонный JSON создан.")
+    else:
+        print("🚫 Решение не применено (база).")
 
-    # Запуск тестов
-    passed = run_tests()
-    
-    # Запись результата
-    expected_reward = 1 if (passed and should_pass) else 0
-    # В реальном сценарии base_do_nothing тесты должны упасть -> reward 0
-    # В сценарии oracle тесты должны пройти -> reward 1
-    
-    actual_reward = 1 if passed else 0
-    write_reward(actual_reward)
-    
-    # Проверка ожидания
-    if name == "base_do_nothing":
-        if actual_reward == 0:
-            print("✅ SUCCESS: База не прошла тесты (reward=0), как и ожидалось.")
-        else:
-            print("❌ FAIL: База прошла тесты (reward=1), но должна была упасть!")
+    # Проверка
+    reward = 0
+    try:
+        if not os.path.exists(OUTPUT_FILE):
+            raise FileNotFoundError("Файл ответа отсутствует")
             
-    elif name == "oracle_solution":
-        if actual_reward == 1:
-            print("✅ SUCCESS: Оракул прошел тесты (reward=1).")
-        else:
-            print("❌ FAIL: Оракул не прошел тесты (reward=0). Проверь solve.sh или тесты.")
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        validate_json_structure(data)
+        validate_content(data)
+        
+        reward = 1
+        print("✅ Тесты пройдены успешно.")
+        
+    except Exception as e:
+        print(f"❌ Тесты провалены: {e}")
+        reward = 0
 
-if __name__ == "__main__":
-    # 1. Проверка базы (без решения)
-    check_scenario("base_do_nothing", should_pass=False)    
-    # 2. Проверка оракула (с решением)
-    check_scenario("oracle_solution", should_pass=True)
-    
-    print("\n Проверка завершена. Файлы reward.txt созданы в папке logs/verifier/")
+    # Запись результата
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    with open(REWARD_FILE, "w") as f:
+        f.write(str(reward))
+    print(f
